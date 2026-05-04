@@ -1,0 +1,53 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: qbackup
+  labels:
+    app.kubernetes.io/name: qbackup
+rules:
+  # Read cluster storage inventory and all namespaces for PVC discovery.
+  - apiGroups: [""]
+    resources: ["namespaces", "persistentvolumeclaims", "persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+
+  # Create helper Pods in application namespaces and stream their logs.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+  # Discover and temporarily scale/restart consumers during backup/restore.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale", "replicasets/scale"]
+    verbs: ["get", "patch", "update"]
+
+  # Manage qbackup CronJobs and manual Jobs for schedules.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: qbackup
+  labels:
+    app.kubernetes.io/name: qbackup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: qbackup
+subjects:
+  - kind: ServiceAccount
+    name: qbackup
+    namespace: qbackup

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: qbackup
+  namespace: qbackup
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: qbackup
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

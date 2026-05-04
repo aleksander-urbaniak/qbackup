@@ -1,0 +1,18 @@
+services:
+  qbackup:
+    build: .
+    image: qbackup:latest
+    container_name: qbackup
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: "8787"
+      KUBECONFIG: /data/.kube/config
+    volumes:
+      - qbackup-data:/data
+      # Put a kubeconfig at ./kubeconfig or replace this with your preferred mount.
+      - ./kubeconfig:/data/.kube/config:ro
+    restart: unless-stopped
+
+volumes:
+  qbackup-data:
