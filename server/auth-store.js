@@ -17,7 +17,7 @@ const rolePermissions = {
   operator: ['dashboard.read', 'backups.run', 'restore.run', 'schedules.manage'],
   manager: ['dashboard.read', 'backups.run', 'restore.run', 'schedules.manage', 'settings.write'],
   auditor: ['dashboard.read', 'audit.read'],
-  admin: ['dashboard.read', 'backups.run', 'restore.run', 'schedules.manage', 'settings.write', 'users.manage', 'audit.read']
+  admin: ['dashboard.read', 'backups.run', 'restore.run', 'schedules.manage', 'settings.write', 'users.manage', 'audit.read', 'files.manage']
 };
 
 function emptyDb() {

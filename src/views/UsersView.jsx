@@ -86,8 +86,8 @@ export default function UsersView({ currentUser, notify }) {
         </div>
       </div>
 
-      <div className="bg-[#0B101A] border border-slate-800/80 rounded-2xl shadow-xl overflow-hidden flex flex-col">
-        <div className="overflow-x-auto">
+      <div className="bg-[#0B101A] border border-slate-800/80 rounded-2xl shadow-xl overflow-x-auto overflow-y-visible flex flex-col">
+        <div className="overflow-visible min-w-full">
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="border-b border-slate-800/80 bg-[#0A0E17]/50">

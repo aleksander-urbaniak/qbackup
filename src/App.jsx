@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Activity, ChevronRight, Clock, HardDrive, LogOut, Menu, RotateCcw, Settings, Users } from 'lucide-react';
+import { Activity, ChevronRight, Clock, Files, HardDrive, LogOut, Menu, RotateCcw, Settings, Users } from 'lucide-react';
 import { api } from './lib/api';
 import { emptySettings } from './lib/settings';
 import { useThemeMode } from './hooks/useThemeMode';
@@ -12,13 +12,15 @@ import RestoreView from './views/RestoreView';
 import LogsView from './views/LogsView';
 import UsersView from './views/UsersView';
 import ProfileView from './views/ProfileView';
+import LiveFilesView from './views/LiveFilesView';
 
-const validTabs = new Set(['pvcs', 'schedules', 'restore', 'logs', 'users', 'settings', 'profile']);
+const validTabs = new Set(['pvcs', 'schedules', 'restore', 'live-files', 'logs', 'users', 'settings', 'profile']);
 const pathToTab = {
   '/': 'pvcs',
   '/pvcs': 'pvcs',
   '/schedules': 'schedules',
   '/restore': 'restore',
+  '/live-files': 'live-files',
   '/logs': 'logs',
   '/users': 'users',
   '/settings': 'settings',
@@ -29,6 +31,7 @@ const tabToPath = {
   pvcs: '/pvcs',
   schedules: '/schedules',
   restore: '/restore',
+  'live-files': '/live-files',
   logs: '/logs',
   users: '/users',
   settings: '/settings',
@@ -168,6 +171,8 @@ export default function App() {
     await loadSession();
   };
 
+  const canUseLiveFiles = Boolean(settings.liveFileExplorerEnabled && user.permissions?.includes('files.manage'));
+
   if (checkingAuth) {
     return <FullScreenState title="qbackup" message="Checking session..." />;
   }
@@ -194,6 +199,7 @@ export default function App() {
           <NavItem icon={<HardDrive />} label="PVCs & Backups" active={activeTab === 'pvcs'} onClick={() => setActiveTab('pvcs')} isOpen={isSidebarOpen} />
           <NavItem icon={<Clock />} label="Schedules" active={activeTab === 'schedules'} onClick={() => setActiveTab('schedules')} isOpen={isSidebarOpen} />
           <NavItem icon={<RotateCcw />} label="Restore" active={activeTab === 'restore'} onClick={() => setActiveTab('restore')} isOpen={isSidebarOpen} />
+          {canUseLiveFiles && <NavItem icon={<Files />} label="Live Files" active={activeTab === 'live-files'} onClick={() => setActiveTab('live-files')} isOpen={isSidebarOpen} />}
           <NavItem icon={<Activity />} label="Audit Logs" active={activeTab === 'logs'} onClick={() => setActiveTab('logs')} isOpen={isSidebarOpen} />
           {user.permissions?.includes('users.manage') && <NavItem icon={<Users />} label="Users" active={activeTab === 'users'} onClick={() => setActiveTab('users')} isOpen={isSidebarOpen} />}
           <NavItem icon={<Settings />} label="Settings" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} isOpen={isSidebarOpen} />
@@ -230,6 +236,7 @@ export default function App() {
               setOpen={setNotificationOpen}
               markAllRead={() => setNotifications((prev) => prev.map((item) => ({ ...item, read: true })))}
               clearAll={() => setNotifications([])}
+              dismissItem={(id) => setNotifications((prev) => prev.filter((item) => item.id !== id))}
               peek={notificationPeek}
               dismissPeek={() => setNotificationPeek(null)}
             />
@@ -249,6 +256,7 @@ export default function App() {
           {activeTab === 'settings' && <SettingsView settings={settings} setSettings={setSettings} notify={notify} refreshConfig={refreshConfig} />}
           {activeTab === 'schedules' && <SchedulesView settings={settings} notify={notify} />}
           {activeTab === 'restore' && <RestoreView notify={notify} startJobStream={startJobStream} />}
+          {activeTab === 'live-files' && canUseLiveFiles && <LiveFilesView notify={notify} />}
           {activeTab === 'logs' && <LogsView jobs={jobs} canReadAudit={user.permissions?.includes('audit.read')} notify={notify} />}
           {activeTab === 'users' && user.permissions?.includes('users.manage') && <UsersView currentUser={user} notify={notify} />}
           {activeTab === 'profile' && <ProfileView user={user} setUser={setUser} notify={notify} />}

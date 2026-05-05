@@ -92,7 +92,8 @@ const defaults = {
   keepFailedPods: envBool('KEEP_FAILED_PODS', false),
   scaleConsumers: envBool('SCALE_CONSUMERS_FOR_BACKUP', true),
   archiveExtension: envString('ARCHIVE_EXTENSION', 'tgz'),
-  localNfsPreflight: envString('LOCAL_NFS_PREFLIGHT', 'mount')
+  localNfsPreflight: envString('LOCAL_NFS_PREFLIGHT', 'mount'),
+  liveFileExplorerEnabled: envBool('LIVE_FILE_EXPLORER_ENABLED', false)
 };
 
 if (['true', '1', 'yes'].includes(String(process.env.QBACKUP_TRUST_PROXY || '').toLowerCase())) {
@@ -100,7 +101,7 @@ if (['true', '1', 'yes'].includes(String(process.env.QBACKUP_TRUST_PROXY || '').
 }
 
 app.disable('x-powered-by');
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -244,7 +245,8 @@ function envKeyToSetting(key) {
     KEEP_FAILED_PODS: 'keepFailedPods',
     SCALE_CONSUMERS_FOR_BACKUP: 'scaleConsumers',
     ARCHIVE_EXTENSION: 'archiveExtension',
-    LOCAL_NFS_PREFLIGHT: 'localNfsPreflight'
+    LOCAL_NFS_PREFLIGHT: 'localNfsPreflight',
+    LIVE_FILE_EXPLORER_ENABLED: 'liveFileExplorerEnabled'
   }[key];
 }
 
@@ -326,6 +328,7 @@ function normalizeCluster(input = {}, fallback = defaults) {
   config.backupConcurrency = normalizeBackupConcurrency(config.backupConcurrency);
   config.keepFailedPods = Boolean(config.keepFailedPods);
   config.scaleConsumers = input.scaleConsumers === undefined ? Boolean(config.scaleConsumers) : Boolean(input.scaleConsumers);
+  config.liveFileExplorerEnabled = input.liveFileExplorerEnabled === undefined ? Boolean(config.liveFileExplorerEnabled) : Boolean(input.liveFileExplorerEnabled);
   config.localNfsPreflight = config.localNfsPreflight || 'mount';
   config.id = String(input.id || input.clusterId || clusterIdFromConfig(config));
   if (input.kubeconfigContent) config.kubeconfigContent = String(input.kubeconfigContent);
@@ -368,7 +371,7 @@ async function readEnvConfig() {
       let value = match[2].trim();
       if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1).replaceAll("'\\''", "'");
       if (setting === 'activeClusterId') config[setting] = value;
-      else if (setting === 'keepFailedPods' || setting === 'scaleConsumers') config[setting] = boolFromEnv(value);
+      else if (setting === 'keepFailedPods' || setting === 'scaleConsumers' || setting === 'liveFileExplorerEnabled') config[setting] = boolFromEnv(value);
       else if (setting === 'backupConcurrency') config[setting] = normalizeBackupConcurrency(value);
       else config[setting] = value;
     }
@@ -397,6 +400,7 @@ async function writeEnvConfig(input) {
     ['KEEP_FAILED_PODS', config.keepFailedPods ? 'true' : 'false'],
     ['ARCHIVE_EXTENSION', config.archiveExtension],
     ['LOCAL_NFS_PREFLIGHT', config.localNfsPreflight || 'mount'],
+    ['LIVE_FILE_EXPLORER_ENABLED', config.liveFileExplorerEnabled ? 'true' : 'false'],
     ['SCALE_CONSUMERS_FOR_BACKUP', config.scaleConsumers ? 'true' : 'false']
   ].map(([key, value]) => `${key}=${shellQuote(value ?? '')}`);
   const tempFile = `${configFile}.${process.pid}.${Date.now()}.tmp`;
@@ -569,6 +573,36 @@ function run(command, args, options = {}) {
   });
 }
 
+function stream(command, args, writable, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { ...options, shell: false });
+    let stderr = '';
+    child.stderr?.on('data', (chunk) => { stderr += chunk; });
+    child.stdout?.pipe(writable);
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve({ stderr });
+      else reject(Object.assign(new Error(stderr || `${command} exited with ${code}`), { stderr, code }));
+    });
+  });
+}
+
+function runWithInput(command, args, input, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { ...options, shell: false });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (chunk) => { stdout += chunk; });
+    child.stderr?.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve({ stdout, stderr });
+      else reject(Object.assign(new Error(stderr || stdout || `${command} exited with ${code}`), { stdout, stderr, code }));
+    });
+    child.stdin?.end(input);
+  });
+}
+
 function kubectlArgs(config, args) {
   if (!config?.clusterId && !config?.id) {
     const error = new Error('No cluster configured. Add a cluster in Settings first.');
@@ -597,6 +631,78 @@ function k8sName(prefix, base, suffix = '') {
   const maxBase = Math.max(1, 63 - reserve);
   const safeBase = sanitizeName(base).slice(0, maxBase).replace(/-+$/g, '') || 'x';
   return suffix ? `${prefix}-${safeBase}-${suffix}` : `${prefix}-${safeBase}`;
+}
+
+function assertArchiveName(config, archive) {
+  if (!/^[A-Za-z0-9._-]+$/.test(archive) || archive.includes('..') || !archive.endsWith(`.${config.archiveExtension}`)) {
+    const error = new Error('Invalid archive name.');
+    error.status = 400;
+    throw error;
+  }
+}
+
+function normalizeRestorePath(value) {
+  const raw = String(value || '.').trim().replaceAll('\\', '/').replace(/^\/+/, '');
+  if (!raw || raw === '.') return '.';
+  if (raw.length > 512) {
+    const error = new Error('Selected path is too long.');
+    error.status = 400;
+    throw error;
+  }
+  const parts = raw.split('/').filter(Boolean);
+  if (parts.some((part) => part === '.' || part === '..')) {
+    const error = new Error('Selected path cannot contain . or .. segments.');
+    error.status = 400;
+    throw error;
+  }
+  return parts.join('/');
+}
+
+function normalizePvcFilePath(value) {
+  return normalizeRestorePath(value);
+}
+
+function normalizePvcEntryName(value) {
+  const name = String(value || '').trim();
+  if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.length > 255) {
+    const error = new Error('File or folder name is invalid.');
+    error.status = 400;
+    throw error;
+  }
+  return name;
+}
+
+function assertLiveFileExplorerEnabled(config) {
+  if (!config.liveFileExplorerEnabled) {
+    const error = new Error('Live file explorer is disabled.');
+    error.status = 403;
+    throw error;
+  }
+}
+
+function zipDownloadName(pvcName, archive, selectedPath) {
+  const archiveBase = archive.replace(/\.[^.]+$/, '');
+  const selected = selectedPath === '.' ? 'full-archive' : selectedPath.split('/').at(-1);
+  return `${safeFileName(pvcName)}-${safeFileName(archiveBase)}-${safeFileName(selected)}.zip`;
+}
+
+function parseTarListEntry(line) {
+  const text = String(line || '').trim();
+  if (!text) return null;
+  const match = text.match(/^([dl-][^\s]*)\s+(?:(\S+)\/(\S+)|\S+\s+\S+)\s+(\d+)\s+(\d{4}-\d{2}-\d{2})\s+([0-9:]+)\s+(.+)$/);
+  if (!match) return null;
+  const rawPath = match[7].replace(/^\.\/+/, '').replace(/\/$/, '');
+  const cleanPath = normalizeRestorePath(rawPath);
+  if (cleanPath === '.') return null;
+  const parts = cleanPath.split('/');
+  const type = match[1].startsWith('d') ? 'directory' : 'file';
+  return {
+    path: cleanPath,
+    name: parts.at(-1) || cleanPath,
+    type,
+    size: type === 'directory' ? '-' : match[4],
+    modified: `${match[5]} ${match[6]}`
+  };
 }
 
 function yamlString(value) {
@@ -1000,6 +1106,202 @@ ${podPlacementYaml(nodeName, 2)}  restartPolicy: Never
 `;
 }
 
+function fileRestorePodManifest(config, namespace, pvc, archive, selectedPath, podName) {
+  return `apiVersion: v1
+kind: Pod
+metadata:
+  name: ${podName}
+  namespace: ${namespace}
+  labels:
+    ${appLabelName}: ${appLabelValue}
+    ${appLabelComponent}: file-restore
+    backup-pvc: ${pvc}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: file-restore
+      image: ${yamlString(config.helperImage)}
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-ceu"]
+      args:
+        - |
+          archive="/backup/\${BACKUP_ROOT}/\${CLUSTER_NAME}/\${PVC_NAMESPACE}/\${PVC_NAME}/\${ARCHIVE_NAME}"
+          test -f "$archive"
+          if ! command -v zip >/dev/null 2>&1; then
+            apk add --no-cache zip >/dev/null
+          fi
+          mkdir -p /work/extract
+          tar -xzf "$archive" -C /work/extract
+          selected="\${SELECTED_PATH}"
+          if [ "$selected" = "." ]; then
+            (cd /work/extract && zip -qr /work/output.zip .)
+          else
+            test -e "/work/extract/$selected"
+            parent="$(dirname "$selected")"
+            name="$(basename "$selected")"
+            (cd "/work/extract/$parent" && zip -qr /work/output.zip "$name")
+          fi
+          touch /work/ready
+          sleep 300
+      env:
+        - name: BACKUP_ROOT
+          value: ${yamlString(config.backupRoot)}
+        - name: CLUSTER_NAME
+          value: ${yamlString(config.clusterName)}
+        - name: PVC_NAMESPACE
+          value: ${yamlString(namespace)}
+        - name: PVC_NAME
+          value: ${yamlString(pvc)}
+        - name: ARCHIVE_NAME
+          value: ${yamlString(archive)}
+        - name: SELECTED_PATH
+          value: ${yamlString(selectedPath)}
+      volumeMounts:
+        - name: backup
+          mountPath: /backup
+          readOnly: true
+        - name: work
+          mountPath: /work
+  volumes:
+    - name: backup
+      nfs:
+        server: ${yamlString(config.nfsServer)}
+        path: ${yamlString(config.nfsExportPath)}
+    - name: work
+      emptyDir: {}
+`;
+}
+
+function fileRestoreCatalogPodManifest(config, namespace, pvc, archive, podName) {
+  return `apiVersion: v1
+kind: Pod
+metadata:
+  name: ${podName}
+  namespace: ${namespace}
+  labels:
+    ${appLabelName}: ${appLabelValue}
+    ${appLabelComponent}: file-restore-catalog
+    backup-pvc: ${pvc}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: catalog
+      image: ${yamlString(config.helperImage)}
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-ceu"]
+      args:
+        - |
+          archive="/backup/\${BACKUP_ROOT}/\${CLUSTER_NAME}/\${PVC_NAMESPACE}/\${PVC_NAME}/\${ARCHIVE_NAME}"
+          test -f "$archive"
+          tar -tvzf "$archive"
+      env:
+        - name: BACKUP_ROOT
+          value: ${yamlString(config.backupRoot)}
+        - name: CLUSTER_NAME
+          value: ${yamlString(config.clusterName)}
+        - name: PVC_NAMESPACE
+          value: ${yamlString(namespace)}
+        - name: PVC_NAME
+          value: ${yamlString(pvc)}
+        - name: ARCHIVE_NAME
+          value: ${yamlString(archive)}
+      volumeMounts:
+        - name: backup
+          mountPath: /backup
+          readOnly: true
+  volumes:
+    - name: backup
+      nfs:
+        server: ${yamlString(config.nfsServer)}
+        path: ${yamlString(config.nfsExportPath)}
+`;
+}
+
+function liveFileHelperPodManifest(config, namespace, pvc, podName, readOnly = true) {
+  return `apiVersion: v1
+kind: Pod
+metadata:
+  name: ${podName}
+  namespace: ${namespace}
+  labels:
+    ${appLabelName}: ${appLabelValue}
+    ${appLabelComponent}: live-file-explorer
+    backup-pvc: ${pvc}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: explorer
+      image: ${yamlString(config.helperImage)}
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-ceu"]
+      args:
+        - |
+          touch /tmp/ready
+          sleep 600
+      volumeMounts:
+        - name: target
+          mountPath: /target
+          readOnly: ${readOnly ? 'true' : 'false'}
+  volumes:
+    - name: target
+      persistentVolumeClaim:
+        claimName: ${pvc}
+        readOnly: ${readOnly ? 'true' : 'false'}
+`;
+}
+
+function liveFileDownloadPodManifest(config, namespace, pvc, selectedPath, podName) {
+  return `apiVersion: v1
+kind: Pod
+metadata:
+  name: ${podName}
+  namespace: ${namespace}
+  labels:
+    ${appLabelName}: ${appLabelValue}
+    ${appLabelComponent}: live-file-download
+    backup-pvc: ${pvc}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: download
+      image: ${yamlString(config.helperImage)}
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-ceu"]
+      args:
+        - |
+          if ! command -v zip >/dev/null 2>&1; then
+            apk add --no-cache zip >/dev/null
+          fi
+          selected="\${SELECTED_PATH}"
+          if [ "$selected" = "." ]; then
+            (cd /target && zip -qr /work/output.zip .)
+          else
+            test -e "/target/$selected"
+            parent="$(dirname "$selected")"
+            name="$(basename "$selected")"
+            (cd "/target/$parent" && zip -qr /work/output.zip "$name")
+          fi
+          touch /work/ready
+          sleep 300
+      env:
+        - name: SELECTED_PATH
+          value: ${yamlString(selectedPath)}
+      volumeMounts:
+        - name: target
+          mountPath: /target
+          readOnly: true
+        - name: work
+          mountPath: /work
+  volumes:
+    - name: target
+      persistentVolumeClaim:
+        claimName: ${pvc}
+        readOnly: true
+    - name: work
+      emptyDir: {}
+`;
+}
+
 async function waitForPodCompletion(config, namespace, podName, append = () => {}, timeoutSeconds = 1800) {
   const started = Date.now();
   let lastPhase = '';
@@ -1030,6 +1332,67 @@ async function runHelperPod(config, namespace, manifest, podName, append = () =>
   await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, podName, '--ignore-not-found', '--wait=false'])).catch(() => null);
   if (phase !== 'Succeeded') throw new Error(`Helper Pod ${namespace}/${podName} finished with phase=${phase}`);
   return logs;
+}
+
+async function waitForFileRestoreReady(config, namespace, podName, timeoutSeconds = 600) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutSeconds * 1000) {
+    const pod = await kubectlJson(config, ['get', 'pod', '-n', namespace, podName]).catch(() => null);
+    const phase = pod?.status?.phase || '';
+    if (phase === 'Failed' || phase === 'Succeeded') {
+      const logs = await run('kubectl', kubectlArgs(config, ['logs', '-n', namespace, podName])).then((result) => result.stdout || result.stderr).catch(() => '');
+      throw new Error(logs || `File restore helper finished before the zip was ready with phase=${phase}`);
+    }
+    const ready = await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'test', '-f', '/work/ready'])).then(() => true).catch(() => false);
+    if (ready) return;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  throw new Error(`Timed out waiting for file restore helper ${namespace}/${podName}`);
+}
+
+async function waitForLiveFileHelperReady(config, namespace, podName, timeoutSeconds = 120) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutSeconds * 1000) {
+    const pod = await kubectlJson(config, ['get', 'pod', '-n', namespace, podName]).catch(() => null);
+    const phase = pod?.status?.phase || '';
+    if (phase === 'Failed' || phase === 'Succeeded') {
+      const logs = await run('kubectl', kubectlArgs(config, ['logs', '-n', namespace, podName])).then((result) => result.stdout || result.stderr).catch(() => '');
+      throw new Error(logs || `Live file helper finished before it was ready with phase=${phase}`);
+    }
+    const ready = await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'test', '-f', '/tmp/ready'])).then(() => true).catch(() => false);
+    if (ready) return;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  throw new Error(`Timed out waiting for live file helper ${namespace}/${podName}`);
+}
+
+async function withLiveFileHelper(config, namespace, pvc, readOnly, callback) {
+  const podName = k8sName('live-files', pvc, Date.now().toString().slice(-10));
+  await applyManifest(config, liveFileHelperPodManifest(config, namespace, pvc, podName, readOnly));
+  try {
+    await waitForLiveFileHelperReady(config, namespace, podName);
+    return await callback(podName);
+  } finally {
+    await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, podName, '--ignore-not-found', '--wait=false'])).catch(() => null);
+  }
+}
+
+function parseLiveFileRows(output, parentPath) {
+  const prefix = parentPath === '.' ? '' : `${parentPath}/`;
+  return output.split(/\r?\n/).filter(Boolean).map((line) => {
+    const [name, type, size, modifiedEpoch] = line.split('\t');
+    const pathValue = prefix + name;
+    return {
+      name,
+      path: pathValue,
+      type,
+      size: type === 'directory' ? '-' : size,
+      modified: Number(modifiedEpoch || 0) > 0 ? new Date(Number(modifiedEpoch) * 1000).toISOString() : '-'
+    };
+  }).sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
 }
 
 app.get('/api/status', async (_req, res) => {
@@ -1175,6 +1538,12 @@ app.get('/api/config', requireAuth(), async (_req, res, next) => {
 
 app.put('/api/config', requireAuth('settings.write'), async (req, res, next) => {
   try {
+    const current = await readConfig();
+    const changingLiveExplorer = Object.prototype.hasOwnProperty.call(req.body || {}, 'liveFileExplorerEnabled')
+      && Boolean(req.body.liveFileExplorerEnabled) !== Boolean(current.liveFileExplorerEnabled);
+    if (changingLiveExplorer && !hasPermission(req.user, 'files.manage')) {
+      return res.status(403).json({ error: 'Only admins can enable or disable the live file explorer.' });
+    }
     const saved = await writeConfig(req.body);
     await logAudit('settings.update', req.user.id, { keys: Object.keys(req.body || {}) });
     res.json(saved);
@@ -1434,9 +1803,7 @@ app.post('/api/restore', requireAuth('restore.run'), async (req, res, next) => {
     const config = await readConfig();
     const { pvc, archive } = req.body;
     if (!pvc || !archive) return res.status(400).json({ error: 'PVC and archive are required.' });
-    if (!/^[A-Za-z0-9._-]+$/.test(archive) || archive.includes('..') || !archive.endsWith(`.${config.archiveExtension}`)) {
-      return res.status(400).json({ error: 'Invalid archive name.' });
-    }
+    assertArchiveName(config, archive);
     const [namespace, pvcName] = String(pvc).split('/');
     if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
     const job = createAsyncJob('restore', async ({ append }) => {
@@ -1456,6 +1823,289 @@ app.post('/api/restore', requireAuth('restore.run'), async (req, res, next) => {
     res.status(202).json(job);
   } catch (error) {
     next(error);
+  }
+});
+
+app.post('/api/file-restore/catalog', requireAuth('restore.run'), async (req, res, next) => {
+  try {
+    const config = await readConfig();
+    const { pvc, archive } = req.body;
+    if (!pvc || !archive) return res.status(400).json({ error: 'PVC and archive are required.' });
+    assertArchiveName(config, archive);
+    const [namespace, pvcName] = String(pvc).split('/');
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    const podName = k8sName('file-catalog', pvcName, Date.now().toString().slice(-10));
+    const output = await runHelperPod(
+      config,
+      namespace,
+      fileRestoreCatalogPodManifest(config, namespace, pvcName, archive, podName),
+      podName,
+      () => {},
+      300
+    );
+    const entries = output.split(/\r?\n/)
+      .map(parseTarListEntry)
+      .filter(Boolean);
+    res.json({ entries });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/file-restore/download', requireAuth('restore.run'), async (req, res, next) => {
+  let config;
+  let namespace;
+  let podName;
+  try {
+    config = await readConfig();
+    const { pvc, archive } = req.body;
+    if (!pvc || !archive) return res.status(400).json({ error: 'PVC and archive are required.' });
+    assertArchiveName(config, archive);
+    const selectedPath = normalizeRestorePath(req.body.path);
+    const [pvcNamespace, pvcName] = String(pvc).split('/');
+    namespace = pvcNamespace;
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+
+    podName = k8sName('file-restore', pvcName, Date.now().toString().slice(-10));
+    await applyManifest(config, fileRestorePodManifest(config, namespace, pvcName, archive, selectedPath, podName));
+    await waitForFileRestoreReady(config, namespace, podName);
+
+    const filename = zipDownloadName(pvcName, archive, selectedPath);
+    await logAudit('file-restore.download', req.user.id, { pvc, archive, path: selectedPath, filename });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    await stream('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'cat', '/work/output.zip']), res);
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      res.destroy(error);
+    } else {
+      next(error);
+    }
+  } finally {
+    if (config && namespace && podName) {
+      await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, podName, '--ignore-not-found', '--wait=false'])).catch(() => null);
+    }
+  }
+});
+
+app.post('/api/live-files/list', requireAuth('files.manage'), async (req, res, next) => {
+  try {
+    const config = await readConfig();
+    assertLiveFileExplorerEnabled(config);
+    const { pvc } = req.body;
+    const selectedPath = normalizePvcFilePath(req.body.path);
+    const [namespace, pvcName] = String(pvc || '').split('/');
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    const output = await withLiveFileHelper(config, namespace, pvcName, true, async (podName) => {
+      const script = `
+        base="/target"
+        dir="$base"
+        if [ "$FILE_PATH" != "." ]; then dir="$base/$FILE_PATH"; fi
+        test -d "$dir"
+        find "$dir" -mindepth 1 -maxdepth 1 -exec sh -c '
+          for item do
+            [ -e "$item" ] || continue
+            name="$(basename "$item")"
+            if [ -d "$item" ]; then type="directory"; size="-"; else type="file"; size="$(stat -c "%s" "$item")"; fi
+            modified="$(stat -c "%Y" "$item")"
+            printf "%s\\t%s\\t%s\\t%s\\n" "$name" "$type" "$size" "$modified"
+          done
+        ' sh {} +
+      `;
+      const { stdout } = await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'env', `FILE_PATH=${selectedPath}`, 'sh', '-ceu', script]));
+      return stdout;
+    });
+    res.json({ path: selectedPath, entries: parseLiveFileRows(output, selectedPath) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/live-files/read', requireAuth('files.manage'), async (req, res, next) => {
+  try {
+    const config = await readConfig();
+    assertLiveFileExplorerEnabled(config);
+    const { pvc } = req.body;
+    const selectedPath = normalizePvcFilePath(req.body.path);
+    if (selectedPath === '.') return res.status(400).json({ error: 'Select a file to open.' });
+    const [namespace, pvcName] = String(pvc || '').split('/');
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    const content = await withLiveFileHelper(config, namespace, pvcName, true, async (podName) => {
+      const script = 'file="/target/$FILE_PATH"; test -f "$file"; cat "$file"';
+      const { stdout } = await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'env', `FILE_PATH=${selectedPath}`, 'sh', '-ceu', script]));
+      return stdout;
+    });
+    await logAudit('live-files.read', req.user.id, { pvc, path: selectedPath });
+    res.json({ path: selectedPath, content });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/live-files/write', requireAuth('files.manage'), async (req, res, next) => {
+  try {
+    const config = await readConfig();
+    assertLiveFileExplorerEnabled(config);
+    const { pvc } = req.body;
+    const selectedPath = normalizePvcFilePath(req.body.path);
+    const content = String(req.body.content ?? '');
+    if (selectedPath === '.') return res.status(400).json({ error: 'Select a file to save.' });
+    if (content.length > 1024 * 1024) return res.status(400).json({ error: 'File editor saves are limited to 1 MiB.' });
+    const [namespace, pvcName] = String(pvc || '').split('/');
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    await withLiveFileHelper(config, namespace, pvcName, false, async (podName) => {
+      const script = 'file="/target/$FILE_PATH"; test -f "$file"; cat > "$file"';
+      await runWithInput('kubectl', kubectlArgs(config, ['exec', '-i', '-n', namespace, podName, '--', 'env', `FILE_PATH=${selectedPath}`, 'sh', '-ceu', script]), content);
+    });
+    await logAudit('live-files.write', req.user.id, { pvc, path: selectedPath, bytes: Buffer.byteLength(content) });
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/live-files/create-file', requireAuth('files.manage'), async (req, res, next) => {
+  try {
+    const config = await readConfig();
+    assertLiveFileExplorerEnabled(config);
+    const { pvc } = req.body;
+    const parentPath = normalizePvcFilePath(req.body.parentPath);
+    const name = normalizePvcEntryName(req.body.name);
+    const [namespace, pvcName] = String(pvc || '').split('/');
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    const filePath = parentPath === '.' ? name : `${parentPath}/${name}`;
+    await withLiveFileHelper(config, namespace, pvcName, false, async (podName) => {
+      const script = `
+        parent="/target/$PARENT_PATH"
+        [ "$PARENT_PATH" = "." ] && parent="/target"
+        if [ ! -d "$parent" ]; then
+          echo "Parent folder does not exist: $PARENT_PATH" >&2
+          exit 2
+        fi
+        target="$parent/$ENTRY_NAME"
+        if [ -e "$target" ]; then
+          echo "File or folder already exists: $ENTRY_NAME" >&2
+          exit 3
+        fi
+        touch "$target"
+      `;
+      await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'env', `PARENT_PATH=${parentPath}`, `ENTRY_NAME=${name}`, 'sh', '-ceu', script]));
+    });
+    await logAudit('live-files.create-file', req.user.id, { pvc, path: filePath });
+    res.json({ ok: true, path: filePath });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/live-files/create-folder', requireAuth('files.manage'), async (req, res, next) => {
+  try {
+    const config = await readConfig();
+    assertLiveFileExplorerEnabled(config);
+    const { pvc } = req.body;
+    const parentPath = normalizePvcFilePath(req.body.parentPath);
+    const name = normalizePvcEntryName(req.body.name);
+    const [namespace, pvcName] = String(pvc || '').split('/');
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    const folderPath = parentPath === '.' ? name : `${parentPath}/${name}`;
+    await withLiveFileHelper(config, namespace, pvcName, false, async (podName) => {
+      const script = `
+        parent="/target/$PARENT_PATH"
+        [ "$PARENT_PATH" = "." ] && parent="/target"
+        if [ ! -d "$parent" ]; then
+          echo "Parent folder does not exist: $PARENT_PATH" >&2
+          exit 2
+        fi
+        target="$parent/$ENTRY_NAME"
+        if [ -e "$target" ]; then
+          echo "File or folder already exists: $ENTRY_NAME" >&2
+          exit 3
+        fi
+        mkdir "$target"
+      `;
+      await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'env', `PARENT_PATH=${parentPath}`, `ENTRY_NAME=${name}`, 'sh', '-ceu', script]));
+    });
+    await logAudit('live-files.create-folder', req.user.id, { pvc, path: folderPath });
+    res.json({ ok: true, path: folderPath });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/live-files/rename', requireAuth('files.manage'), async (req, res, next) => {
+  try {
+    const config = await readConfig();
+    assertLiveFileExplorerEnabled(config);
+    const { pvc } = req.body;
+    const selectedPath = normalizePvcFilePath(req.body.path);
+    const name = normalizePvcEntryName(req.body.name);
+    if (selectedPath === '.') return res.status(400).json({ error: 'Cannot rename the PVC root.' });
+    const [namespace, pvcName] = String(pvc || '').split('/');
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    const nextPath = selectedPath.includes('/') ? `${selectedPath.split('/').slice(0, -1).join('/')}/${name}` : name;
+    await withLiveFileHelper(config, namespace, pvcName, false, async (podName) => {
+      const script = 'source="/target/$FILE_PATH"; parent="$(dirname "$source")"; target="$parent/$ENTRY_NAME"; test -e "$source"; test ! -e "$target"; mv "$source" "$target"';
+      await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'env', `FILE_PATH=${selectedPath}`, `ENTRY_NAME=${name}`, 'sh', '-ceu', script]));
+    });
+    await logAudit('live-files.rename', req.user.id, { pvc, from: selectedPath, to: nextPath });
+    res.json({ ok: true, path: nextPath });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/live-files/delete', requireAuth('files.manage'), async (req, res, next) => {
+  try {
+    const config = await readConfig();
+    assertLiveFileExplorerEnabled(config);
+    const { pvc } = req.body;
+    const selectedPath = normalizePvcFilePath(req.body.path);
+    if (selectedPath === '.') return res.status(400).json({ error: 'Cannot delete the PVC root.' });
+    const [namespace, pvcName] = String(pvc || '').split('/');
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    await withLiveFileHelper(config, namespace, pvcName, false, async (podName) => {
+      const script = 'target="/target/$FILE_PATH"; test -e "$target"; rm -rf "$target"';
+      await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'env', `FILE_PATH=${selectedPath}`, 'sh', '-ceu', script]));
+    });
+    await logAudit('live-files.delete', req.user.id, { pvc, path: selectedPath });
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/live-files/download', requireAuth('files.manage'), async (req, res, next) => {
+  let config;
+  let namespace;
+  let podName;
+  try {
+    config = await readConfig();
+    assertLiveFileExplorerEnabled(config);
+    const { pvc } = req.body;
+    const selectedPath = normalizePvcFilePath(req.body.path);
+    const [pvcNamespace, pvcName] = String(pvc || '').split('/');
+    namespace = pvcNamespace;
+    if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    podName = k8sName('live-download', pvcName, Date.now().toString().slice(-10));
+    await applyManifest(config, liveFileDownloadPodManifest(config, namespace, pvcName, selectedPath, podName));
+    await waitForFileRestoreReady(config, namespace, podName);
+    const filename = zipDownloadName(pvcName, 'live-files.tgz', selectedPath);
+    await logAudit('live-files.download', req.user.id, { pvc, path: selectedPath, filename });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    await stream('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'cat', '/work/output.zip']), res);
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      res.destroy(error);
+    } else {
+      next(error);
+    }
+  } finally {
+    if (config && namespace && podName) {
+      await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, podName, '--ignore-not-found', '--wait=false'])).catch(() => null);
+    }
   }
 });
 

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Bell, Check, CheckCircle, CheckCircle2, ChevronDown, HardDrive, Minus, Moon, ShieldCheck, Sun, Terminal, X } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { AlertTriangle, Bell, Check, CheckCircle, CheckCircle2, ChevronDown, HardDrive, Info, Minus, Moon, ShieldCheck, Sun, Terminal, X, XCircle } from 'lucide-react';
 
 export function FullScreenState({ title, message }) {
   return (
@@ -99,16 +100,45 @@ export function SelectField({ label, name, value, onChange, options }) {
 
 export function StyledSelect({ value, onChange, options, name, className = '', title, disabled = false }) {
   const [open, setOpen] = useState(false);
+  const [menuStyle, setMenuStyle] = useState({});
   const ref = useRef(null);
+  const menuRef = useRef(null);
   const selected = options.find(([id]) => id === value) || options[0];
 
   useEffect(() => {
     const close = (event) => {
-      if (!ref.current?.contains(event.target)) setOpen(false);
+      if (!ref.current?.contains(event.target) && !menuRef.current?.contains(event.target)) setOpen(false);
     };
     document.addEventListener('pointerdown', close);
     return () => document.removeEventListener('pointerdown', close);
   }, []);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const updatePosition = () => {
+      const rect = ref.current?.getBoundingClientRect();
+      if (!rect) return;
+      const menuHeight = Math.min(256, options.length * 42 + 12);
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const top = spaceBelow < menuHeight + 12 && rect.top > menuHeight
+        ? rect.top - menuHeight - 6
+        : rect.bottom + 6;
+      setMenuStyle({
+        position: 'fixed',
+        left: `${Math.min(rect.left, window.innerWidth - 384 - 16)}px`,
+        top: `${Math.max(8, top)}px`,
+        minWidth: `${rect.width}px`,
+        zIndex: 9999
+      });
+    };
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [open, options.length]);
 
   const choose = (nextValue, disabledOption) => {
     if (disabled || disabledOption) return;
@@ -130,8 +160,8 @@ export function StyledSelect({ value, onChange, options, name, className = '', t
         <span className="block truncate text-left">{selected?.[1] || ''}</span>
       </button>
       <ChevronDown className="qbackup-select-chevron" />
-      {open && (
-        <div className="qbackup-select-menu" role="listbox">
+      {open && createPortal(
+        <div ref={menuRef} className="qbackup-select-menu" role="listbox" style={menuStyle}>
           {options.map(([id, labelText, disabledOption]) => (
             <button
               key={id}
@@ -145,7 +175,8 @@ export function StyledSelect({ value, onChange, options, name, className = '', t
               {labelText}
             </button>
           ))}
-        </div>
+        </div>,
+        document.body
       )}
     </span>
   );
@@ -172,46 +203,90 @@ export function StatusBadge({ active, backingUp, label }) {
 export function StatusPill({ label, ok }) {
   return <span className={`hidden md:inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs border ${ok ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>{ok ? <CheckCircle className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}{label}</span>;
 }
-export function NotificationBell({ notifications, open, setOpen, markAllRead, clearAll, peek, dismissPeek }) {
+export function NotificationBell({ notifications, open, setOpen, markAllRead, clearAll, dismissItem, peek, dismissPeek }) {
   const unread = notifications.filter((item) => !item.read).length;
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const close = (event) => {
+      if (!ref.current?.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [open, setOpen]);
+
   return (
-    <div className="relative">
+    <div ref={ref} className="relative">
       <button
         onClick={() => {
           setOpen(!open);
           if (!open) markAllRead();
         }}
-        className="relative p-2 rounded-full text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+        className={`relative flex h-9 w-9 items-center justify-center rounded-full transition-all duration-200 ${
+          open
+            ? 'bg-indigo-500/10 text-indigo-400 ring-1 ring-indigo-500/30'
+            : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+        }`}
         title="Notifications"
       >
-        <Bell className="w-4 h-4" />
-        {unread > 0 && <span className="absolute -right-1 -top-1 min-w-4 h-4 px-1 rounded-full bg-red-500 text-white text-[10px] leading-4 text-center font-bold">{unread}</span>}
+        <Bell className="w-[18px] h-[18px]" />
+        {unread > 0 && <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-rose-500 ring-2 ring-[#0A0E17]" />}
       </button>
       {open && (
-        <div className="absolute right-0 top-12 z-50 w-[22rem] max-w-[calc(100vw-2rem)] qbackup-card overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
+        <div className="absolute right-0 top-12 z-50 flex w-[380px] max-w-[calc(100vw-2rem)] origin-top-right flex-col overflow-hidden rounded-xl border border-slate-700/60 bg-[#0f172a] shadow-[0_16px_40px_-15px_rgba(0,0,0,0.5)] animate-[notificationSlideDown_0.2s_ease-out]">
+          <div className="flex items-center justify-between border-b border-slate-800/80 bg-slate-900/50 px-5 py-4">
             <div>
-              <div className="font-semibold text-sm">Notifications</div>
-              <div className="text-xs text-slate-500">{notifications.length} recent events</div>
+              <div className="flex items-center gap-2 font-semibold text-slate-100">
+                <span>Notifications</span>
+                {unread > 0 && <span className="rounded-full bg-indigo-500/20 px-2 py-0.5 text-xs font-medium text-indigo-300">{unread} new</span>}
+              </div>
+              <div className="mt-0.5 text-xs text-slate-400">{notifications.length} recent events</div>
             </div>
-            <button onClick={clearAll} className="text-xs text-slate-500 hover:text-slate-900">Clear</button>
+            {notifications.length > 0 && (
+              <button onClick={clearAll} className="rounded-md px-2.5 py-1.5 text-xs font-medium text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-200">Clear all</button>
+            )}
           </div>
-          <div className="max-h-96 overflow-auto">
+          <div className="qbackup-notification-scroll max-h-[420px] overflow-y-auto">
             {notifications.length === 0 ? (
-              <div className="p-5 text-sm text-slate-500">No notifications yet.</div>
-            ) : notifications.map((item) => (
-              <div key={item.id} className="px-4 py-3 border-b border-slate-200 last:border-b-0">
-                <div className="flex items-start gap-3">
-                  <span className={`mt-1 h-2.5 w-2.5 rounded-full flex-shrink-0 ${item.tone === 'error' ? 'bg-red-500' : item.tone === 'success' ? 'bg-emerald-500' : 'bg-slate-400'}`} />
-                  <div className="min-w-0">
-                    <div className="font-medium text-sm">{item.title}</div>
-                    <div className="text-sm text-slate-500 mt-0.5 break-words">{item.message}</div>
-                    <div className="text-[11px] text-slate-400 mt-1">{new Date(item.createdAt).toLocaleString()}</div>
-                  </div>
+              <div className="flex flex-col items-center justify-center px-6 py-12 text-center">
+                <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-slate-800/50">
+                  <Bell className="h-5 w-5 text-slate-500" />
                 </div>
+                <p className="text-sm font-medium text-slate-300">No new notifications</p>
+                <p className="mt-1 text-xs text-slate-500">You're all caught up.</p>
+              </div>
+            ) : notifications.map((item) => (
+              <div
+                key={item.id}
+                className={`group relative flex cursor-default items-start gap-4 border-b border-slate-800/40 px-5 py-4 transition-colors last:border-b-0 hover:bg-slate-800/40 ${item.read ? '' : 'bg-slate-800/20'}`}
+              >
+                {!item.read && <div className="absolute bottom-0 left-0 top-0 w-0.5 bg-indigo-500" />}
+                <NotificationToneIcon tone={item.tone} />
+                <div className="min-w-0 flex-1 pt-0.5">
+                  <div className="flex items-start justify-between">
+                    <h4 className="truncate pr-4 text-sm font-medium text-slate-200">{item.title}</h4>
+                    <span className="mt-1 whitespace-nowrap font-mono text-[10px] tabular-nums text-slate-500">{notificationTime(item.createdAt)}</span>
+                  </div>
+                  <p className="mt-1 whitespace-pre-line break-words text-xs leading-relaxed text-slate-400">{item.message}</p>
+                  <p className="mt-2 font-mono text-[10px] text-slate-600">{notificationDate(item.createdAt)}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => dismissItem?.(item.id)}
+                  className="absolute right-4 top-4 rounded-md p-1 text-slate-500 opacity-0 transition-opacity hover:text-slate-300 group-hover:opacity-100"
+                  title="Dismiss"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
               </div>
             ))}
           </div>
+          {notifications.length > 0 && (
+            <div className="border-t border-slate-800/80 bg-[#0f172a] px-5 py-3 text-center">
+              <span className="text-xs font-medium text-indigo-400">Recent activity</span>
+            </div>
+          )}
         </div>
       )}
       {peek && !open && (
@@ -234,6 +309,26 @@ export function NotificationBell({ notifications, open, setOpen, markAllRead, cl
       )}
     </div>
   );
+}
+
+function NotificationToneIcon({ tone }) {
+  if (tone === 'success') {
+    return <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full border border-emerald-500/20 bg-emerald-500/10"><CheckCircle2 className="h-4 w-4 text-emerald-400" /></div>;
+  }
+  if (tone === 'error') {
+    return <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full border border-rose-500/20 bg-rose-500/10"><XCircle className="h-4 w-4 text-rose-400" /></div>;
+  }
+  return <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full border border-blue-500/20 bg-blue-500/10"><Info className="h-4 w-4 text-blue-400" /></div>;
+}
+
+function notificationTime(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString();
+}
+
+function notificationDate(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleDateString();
 }
 export function EmptyRow({ colSpan, icon, text }) {
   return <tr><td colSpan={colSpan} className="px-4 py-12 text-center text-slate-500">{React.cloneElement(icon, { className: 'w-12 h-12 mx-auto text-slate-300 mb-3' })}<p>{text}</p></td></tr>;
