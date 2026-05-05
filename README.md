@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  Discover persistent volume claims, run on-demand backups, schedule recurring jobs, restore archives, and audit activity from one clean dashboard.
+  Discover persistent volume claims, run on-demand backups, schedule recurring jobs, restore archives, recover individual files, and audit activity from one clean dashboard.
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
 
 ## What It Does
 
-qbackup is a browser-based operations app for Kubernetes PVC backup and restore workflows. The server talks to Kubernetes through `kubectl`, creates helper Pods for backup and restore work, manages schedule CronJobs, stores local auth/config data, and streams job logs back to the UI.
+qbackup is a browser-based operations app for Kubernetes PVC backup, restore, and file recovery workflows. The server talks to Kubernetes through `kubectl`, creates short-lived helper Pods for backup, restore, file browsing, and download work, manages schedule CronJobs, stores local auth/config data, and streams job logs back to the UI.
 
 It is built for homelab and self-hosted Kubernetes operators who want PVC backup workflows without living entirely in a terminal.
 
@@ -43,21 +43,34 @@ It is built for homelab and self-hosted Kubernetes operators who want PVC backup
 | **PVC discovery** | List persistent volume claims across namespaces with size, phase, storage class, and actions. |
 | **On-demand backups** | Start single or bulk PVC backups from the dashboard. |
 | **Schedules** | Create, edit, suspend, resume, manually run, and delete Kubernetes CronJob-based backup schedules. |
-| **Restore** | Browse archive catalogs and launch restore jobs through helper Pods. |
+| **Restore** | Browse archive catalogs, launch full PVC restores, or recover selected files/folders from backups as zip downloads. |
+| **Live file explorer** | Optional admin-only PVC file browser with inline tree navigation, Monaco text editor, create/rename/delete, and zip download actions. |
 | **Live logs** | Stream backup and restore job output into the web UI. |
 | **Multi-cluster config** | Store cluster settings and switch active cluster context from the app. |
 | **Users and roles** | Bootstrap the first admin, manage users, and assign role-based permissions. |
-| **Audit trail** | Track auth, user, settings, schedule, backup, and restore actions. |
+| **Audit trail** | Track auth, user, settings, schedule, backup, restore, and live file actions. |
 | **Self-hosting** | Run locally, in Docker, or inside Kubernetes with included manifests. |
 
 ## App Sections
 
 - **PVCs & Backups** - discover PVCs, inspect details, and start backup jobs.
 - **Schedules** - manage recurring backup schedules powered by Kubernetes CronJobs.
-- **Restore** - browse backup archives and start restore workflows.
+- **Restore** - browse backup archives, run full PVC restores, or open a file-restore browser to download selected paths from an archive.
+- **Live Files** - optional admin-only section for browsing live PVC contents, editing text files, managing files/folders, and downloading selected paths as zip archives.
 - **Audit Logs** - review application activity and job history.
 - **Users** - manage local users and roles.
-- **Settings** - configure Kubernetes context, cluster name, NFS target, backup root, helper image, retention, and defaults.
+- **Settings** - configure Kubernetes context, cluster name, NFS target, backup root, helper image, retention, defaults, and the optional live file explorer.
+
+## File Restore and Live Files
+
+qbackup supports two file-level workflows:
+
+- **File restore from backup archives**: select a PVC, choose a backup archive, browse the archive in a tree-style picker, and download a selected file or folder as a zip.
+- **Live Files**: when enabled by an admin in Settings, a sidebar tab appears for admins. It lets admins browse live PVC contents, open text files in a built-in Monaco editor, save changes back to the PVC, create files/folders, rename, delete, and download selected files/folders as zip archives.
+
+Live Files is disabled by default because it writes directly to mounted PVC data. Enable it only for trusted administrators and test it on non-critical volumes first.
+
+The file-level workflows use short-lived helper Pods. Download helpers may install `zip` with `apk add --no-cache zip` when the configured helper image does not already include it, so either allow package repository access from helper Pods or use a helper image that includes `zip`.
 
 ## Quick Start
 
@@ -151,7 +164,7 @@ Roles:
 
 | Role | Access |
 | --- | --- |
-| **admin** | All permissions |
+| **admin** | All permissions, including optional live file explorer access |
 | **manager** | Backup, restore, schedules, settings |
 | **operator** | Backup, restore, schedules |
 | **auditor** | Dashboard and audit logs |
@@ -182,12 +195,21 @@ QBACKUP_TRUST_PROXY=true
 QBACKUP_BOOTSTRAP_CLUSTER=false
 ```
 
+Live file explorer can also be seeded through configuration:
+
+```bash
+LIVE_FILE_EXPLORER_ENABLED=false
+```
+
+It can be toggled later from Settings by an admin.
+
 ## Production Notes
 
 - Put qbackup behind HTTPS and set `QBACKUP_SECURE_COOKIES=true`.
 - Keep `QBACKUP_TRUST_PROXY=true` when TLS terminates at an ingress or reverse proxy.
 - Mount `/data` on persistent storage so auth, audit, and cluster config survive restarts.
 - Review `deploy/kubernetes/rbac.yaml` before applying it. It intentionally grants cluster-wide access to PVCs, helper Pods, CronJobs, Jobs, and workload scaling.
+- Treat the optional Live Files feature as privileged write access to application data. Keep it disabled unless you need it, and restrict admin accounts carefully.
 - Use the first-run UI bootstrap to create the initial admin.
 - Prefer a private image registry and pin immutable image tags instead of relying on `latest`.
 - Test backup and restore behavior on disposable workloads before trusting it with important data.
