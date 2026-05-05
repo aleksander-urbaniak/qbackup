@@ -127,6 +127,10 @@ export default function SettingsView({ settings, setSettings, notify, refreshCon
             <CustomCheckbox checked={settings.keepFailedPods} onChange={() => handleChange({ target: { name: 'keepFailedPods', type: 'checkbox', checked: !settings.keepFailedPods } })} ariaLabel="Keep failed helper Pods" />
             <div><div className="font-medium text-slate-200 text-sm">Keep failed helper Pods</div><div className="text-xs text-slate-400">Preserves failed Pods for diagnostics after backup or restore operations.</div></div>
           </label>
+          <label className="col-span-full flex items-center gap-3 p-4 border border-amber-500/20 bg-amber-500/10 rounded-lg cursor-pointer hover:bg-amber-500/15 transition-colors">
+            <CustomCheckbox checked={settings.liveFileExplorerEnabled} onChange={() => handleChange({ target: { name: 'liveFileExplorerEnabled', type: 'checkbox', checked: !settings.liveFileExplorerEnabled } })} ariaLabel="Enable live PVC file explorer" />
+            <div><div className="font-medium text-amber-100 text-sm">Enable live PVC file explorer</div><div className="text-xs text-amber-200/70">Adds an admin-only sidebar tab for browsing and editing live PVC files.</div></div>
+          </label>
         </SettingsPanel>
         <SettingsPanel icon={<Clock />} title="Scheduling & Retention Defaults">
           <TextField label="Default Cron Schedule" name="defaultSchedule" value={settings.defaultSchedule} onChange={handleChange} mono />
