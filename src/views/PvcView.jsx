@@ -28,10 +28,15 @@ export default function PvcView({ settings, notify, startJobStream }) {
 
   const filteredPvcs = useMemo(() => pvcs.filter((pvc) => `${pvc.namespace}/${pvc.name}/${pvc.sc}/${pvc.phase}`.toLowerCase().includes(search.toLowerCase())), [pvcs, search]);
   const selectedPvcs = pvcs.filter((pvc) => selected.includes(pvc.id));
-  const allVisibleSelected = filteredPvcs.length > 0 && filteredPvcs.every((pvc) => selected.includes(pvc.id));
+  const selectablePvcs = filteredPvcs.filter((pvc) => !pvc.qbackupInternal);
+  const allVisibleSelected = selectablePvcs.length > 0 && selectablePvcs.every((pvc) => selected.includes(pvc.id));
 
-  const toggleSelect = (id) => setSelected((prev) => prev.includes(id) ? prev.filter((value) => value !== id) : [...prev, id]);
-  const toggleAll = () => setSelected((prev) => allVisibleSelected ? prev.filter((id) => !filteredPvcs.some((pvc) => pvc.id === id)) : [...new Set([...prev, ...filteredPvcs.map((pvc) => pvc.id)])]);
+  const toggleSelect = (id) => {
+    const pvc = pvcs.find((item) => item.id === id);
+    if (pvc?.qbackupInternal) return;
+    setSelected((prev) => prev.includes(id) ? prev.filter((value) => value !== id) : [...prev, id]);
+  };
+  const toggleAll = () => setSelected((prev) => allVisibleSelected ? prev.filter((id) => !selectablePvcs.some((pvc) => pvc.id === id)) : [...new Set([...prev, ...selectablePvcs.map((pvc) => pvc.id)])]);
 
   const handleBackup = async (pvcIds) => {
     const targetIds = pvcIds ?? selected;
@@ -98,11 +103,12 @@ export default function PvcView({ settings, notify, startJobStream }) {
             {filteredPvcs.map((pvc) => (
               <tr key={pvc.id} className={`${tableRowClass} ${selected.includes(pvc.id) ? 'bg-blue-500/5 hover:bg-blue-500/10' : ''}`}>
                 <td className="px-6 py-3.5 whitespace-nowrap">
-                  <CustomCheckbox checked={selected.includes(pvc.id)} onChange={() => toggleSelect(pvc.id)} ariaLabel={`Select ${pvc.namespace}/${pvc.name}`} />
+                  <CustomCheckbox checked={selected.includes(pvc.id)} disabled={pvc.qbackupInternal} onChange={() => toggleSelect(pvc.id)} ariaLabel={`Select ${pvc.namespace}/${pvc.name}`} />
                 </td>
                 <td className={`${tableTdClass} font-mono`}>{pvc.namespace}</td>
                 <td className="px-4 py-3.5 whitespace-nowrap">
                   <span className="text-sm font-medium text-slate-100 group-hover:text-white transition-colors">{pvc.name}</span>
+                  {pvc.qbackupInternal && <span className="ml-2 align-middle text-[11px] font-medium text-blue-300 bg-blue-500/10 border border-blue-500/20 px-1.5 py-0.5 rounded">qbackup data</span>}
                 </td>
                 <td className="px-4 py-3.5 whitespace-nowrap">
                   <div className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium ring-1 ring-inset ${pvc.phase === 'Bound' ? 'bg-emerald-500/10 text-emerald-300 ring-emerald-500/20' : 'bg-amber-500/10 text-amber-300 ring-amber-500/20'}`}>
@@ -114,7 +120,7 @@ export default function PvcView({ settings, notify, startJobStream }) {
                 <td className={tableTdClass}>{pvc.sc}</td>
                 <td className={tableTdActionClass}>
                   <div className={tableActionGroupClass}>
-                    <button onClick={() => handleBackup([pvc.id])} disabled={pvc.phase !== 'Bound'} className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed" title="Backup Now"><Play className="w-4 h-4" /></button>
+                    <button onClick={() => handleBackup([pvc.id])} disabled={pvc.phase !== 'Bound' || pvc.qbackupInternal} className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed" title={pvc.qbackupInternal ? 'qbackup data PVC' : 'Backup Now'}><Play className="w-4 h-4" /></button>
                     <button onClick={() => setInspect(pvc)} className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-md transition-colors" title="Inspect">
                       <Eye className="w-4 h-4" />
                     </button>

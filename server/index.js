@@ -731,6 +731,13 @@ function podUsesPvc(pod, pvc) {
   return (pod.spec?.volumes || []).some((volume) => volume.persistentVolumeClaim?.claimName === pvc);
 }
 
+function isQbackupAppPod(pod) {
+  if (pod.metadata?.labels?.[appLabelComponent]) return false;
+  if (pod.metadata?.labels?.[appLabelName] === appLabelValue) return true;
+  if (pod.metadata?.labels?.app === appLabelValue) return true;
+  return pod.spec?.serviceAccountName === appLabelValue && (pod.spec?.containers || []).some((container) => container.name === appLabelValue);
+}
+
 async function pvcConsumerPods(config, namespace, pvc) {
   const json = await kubectlJson(config, ['get', 'pods', '-n', namespace]);
   return (json.items || []).filter((pod) => {
@@ -738,6 +745,33 @@ async function pvcConsumerPods(config, namespace, pvc) {
     if (pod.metadata.labels?.[appLabelName] === appLabelValue) return false;
     return podUsesPvc(pod, pvc);
   });
+}
+
+function qbackupInternalPvcKeysFromPods(pods) {
+  const keys = new Set();
+  for (const pod of pods || []) {
+    if (pod.metadata?.deletionTimestamp || !isQbackupAppPod(pod)) continue;
+    const namespace = pod.metadata?.namespace;
+    if (!namespace) continue;
+    for (const volume of pod.spec?.volumes || []) {
+      const claimName = volume.persistentVolumeClaim?.claimName;
+      if (claimName) keys.add(`${namespace}/${claimName}`);
+    }
+  }
+  return keys;
+}
+
+async function qbackupInternalPvcKeys(config) {
+  const json = await kubectlJson(config, ['get', 'pods', '-A']);
+  return qbackupInternalPvcKeysFromPods(json.items || []);
+}
+
+async function assertNotQbackupInternalPvc(config, namespace, pvc) {
+  const internalKeys = await qbackupInternalPvcKeys(config);
+  if (!internalKeys.has(`${namespace}/${pvc}`)) return;
+  const error = new Error(`PVC ${namespace}/${pvc} stores qbackup's own runtime data and cannot be backed up, scheduled, or restored by qbackup while the app is running.`);
+  error.status = 400;
+  throw error;
 }
 
 function controllerRef(pod) {
@@ -1604,7 +1638,11 @@ app.post('/api/clusters/:id/switch', requireAuth(), async (req, res, next) => {
 app.get('/api/pvcs', requireAuth(), async (_req, res, next) => {
   try {
     const config = await readConfig();
-    const json = await kubectlJson(config, ['get', 'pvc', '-A']);
+    const [json, podJson] = await Promise.all([
+      kubectlJson(config, ['get', 'pvc', '-A']),
+      kubectlJson(config, ['get', 'pods', '-A'])
+    ]);
+    const internalKeys = qbackupInternalPvcKeysFromPods(podJson.items || []);
     const pvcs = (json.items || []).sort((a, b) => `${a.metadata.namespace}/${a.metadata.name}`.localeCompare(`${b.metadata.namespace}/${b.metadata.name}`)).map((item) => ({
       id: `${item.metadata.namespace}/${item.metadata.name}`,
       namespace: item.metadata.namespace,
@@ -1613,7 +1651,8 @@ app.get('/api/pvcs', requireAuth(), async (_req, res, next) => {
       sc: item.spec?.storageClassName || '-',
       access: [...(item.status?.accessModes || item.spec?.accessModes || [])].join(',') || '-',
       size: item.spec?.resources?.requests?.storage || '-',
-      pv: item.spec?.volumeName || '-'
+      pv: item.spec?.volumeName || '-',
+      qbackupInternal: internalKeys.has(`${item.metadata.namespace}/${item.metadata.name}`)
     }));
     res.json(pvcs);
   } catch (error) {
@@ -1680,6 +1719,7 @@ app.post('/api/schedules', requireAuth('schedules.manage'), async (req, res, nex
     for (const tag of pvcs) {
       const [namespace, pvc] = String(tag).split('/');
       if (!namespace || !pvc) throw new Error(`Invalid PVC tag: ${tag}`);
+      await assertNotQbackupInternalPvc(config, namespace, pvc);
       const nodeName = await findPvcConsumerNode(config, namespace, pvc);
       const output = await applyManifest(config, cronJobManifest(config, namespace, pvc, schedule, nodeName));
       results.push({ namespace, pvc, output });
@@ -1732,6 +1772,7 @@ app.post('/api/schedules/:namespace/:name/run', requireAuth('schedules.manage'),
     const config = await readConfig();
     const current = await kubectlJson(config, ['get', 'cronjob', '-n', req.params.namespace, req.params.name]);
     const pvc = current.metadata?.labels?.['backup-pvc'];
+    if (pvc) await assertNotQbackupInternalPvc(config, req.params.namespace, pvc);
     const nodeName = pvc ? await findPvcConsumerNode(config, req.params.namespace, pvc) : '';
     if (nodeName) {
       const patch = JSON.stringify({ spec: { jobTemplate: { spec: { template: { spec: { nodeName } } } } } });
@@ -1760,6 +1801,7 @@ app.post('/api/backups', requireAuth('backups.run'), async (req, res, next) => {
           const tag = tags[nextIndex++];
         const [namespace, pvc] = String(tag).split('/');
         if (!namespace || !pvc) throw new Error(`Invalid PVC tag: ${tag}`);
+        await assertNotQbackupInternalPvc(config, namespace, pvc);
         const podName = k8sName('backup', pvc, Date.now().toString().slice(-10));
           const nodeName = await findPvcConsumerNode(config, namespace, pvc);
           append(`[${new Date().toISOString()}] Starting backup for ${namespace}/${pvc}${nodeName ? ` on ${nodeName}` : ''}\n`);
@@ -1806,6 +1848,7 @@ app.post('/api/restore', requireAuth('restore.run'), async (req, res, next) => {
     assertArchiveName(config, archive);
     const [namespace, pvcName] = String(pvc).split('/');
     if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
+    await assertNotQbackupInternalPvc(config, namespace, pvcName);
     const job = createAsyncJob('restore', async ({ append }) => {
       const podName = k8sName('restore', pvcName, Date.now().toString().slice(-10));
       let restoreConsumers = async () => {};

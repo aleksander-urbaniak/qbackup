@@ -334,9 +334,10 @@ export function EmptyRow({ colSpan, icon, text }) {
   return <tr><td colSpan={colSpan} className="px-4 py-12 text-center text-slate-500">{React.cloneElement(icon, { className: 'w-12 h-12 mx-auto text-slate-300 mb-3' })}<p>{text}</p></td></tr>;
 }
 
-export function CustomCheckbox({ checked, indeterminate = false, onChange, ariaLabel }) {
+export function CustomCheckbox({ checked, indeterminate = false, disabled = false, onChange, ariaLabel }) {
   const handleClick = (event) => {
     event.stopPropagation();
+    if (disabled) return;
     onChange?.(event);
   };
 
@@ -345,9 +346,13 @@ export function CustomCheckbox({ checked, indeterminate = false, onChange, ariaL
       type="button"
       role="checkbox"
       aria-checked={indeterminate ? 'mixed' : checked}
+      disabled={disabled}
       aria-label={ariaLabel || 'Select row'}
       onClick={handleClick}
       className={`relative w-[18px] h-[18px] rounded transition-all duration-200 flex items-center justify-center border focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F1523] ${
+        disabled
+          ? 'bg-slate-900/50 border-slate-700 text-transparent cursor-not-allowed opacity-50'
+          :
         checked || indeterminate
           ? 'bg-blue-600 border-blue-600 text-white'
           : 'bg-[#0A0E17] border-slate-600 hover:border-slate-400 hover:bg-slate-800/50 text-transparent'
