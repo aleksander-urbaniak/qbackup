@@ -61,6 +61,10 @@ const legacyConfigFile = path.join(process.env.XDG_CONFIG_HOME || path.join(os.h
 const appLabelName = 'app.kubernetes.io/name';
 const appLabelComponent = 'app.kubernetes.io/component';
 const appLabelValue = 'qbackup';
+const schedulePlacementRefreshMs = 60 * 1000;
+const scheduleStartingDeadlineSeconds = 15 * 60;
+const backupJobActiveDeadlineSeconds = 2 * 60 * 60;
+const backupJobTtlSecondsAfterFinished = 24 * 60 * 60;
 const jobs = new Map();
 const rateBuckets = new Map();
 
@@ -879,12 +883,15 @@ metadata:
     backup-pvc: ${pvc}
 spec:
   schedule: ${yamlString(schedule)}
+  startingDeadlineSeconds: ${scheduleStartingDeadlineSeconds}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
       backoffLimit: 0
+      activeDeadlineSeconds: ${backupJobActiveDeadlineSeconds}
+      ttlSecondsAfterFinished: ${backupJobTtlSecondsAfterFinished}
       template:
         metadata:
           labels:
@@ -949,6 +956,122 @@ async function applyManifest(config, manifest) {
     return stdout || stderr;
   } finally {
     await fs.rm(temp, { force: true });
+  }
+}
+
+async function patchCronJobPlacement(config, namespace, name, nodeName) {
+  const patch = nodeName
+    ? [{ op: 'add', path: '/spec/jobTemplate/spec/template/spec/nodeName', value: nodeName }]
+    : [{ op: 'remove', path: '/spec/jobTemplate/spec/template/spec/nodeName' }];
+  try {
+    const { stdout, stderr } = await run('kubectl', kubectlArgs(config, ['patch', 'cronjob', '-n', namespace, name, '--type', 'json', '-p', JSON.stringify(patch)]));
+    return stdout || stderr;
+  } catch (error) {
+    if (!nodeName && String(error.stderr || error.message || '').includes('missing path')) return '';
+    throw error;
+  }
+}
+
+async function patchCronJobSafety(config, namespace, name) {
+  const patch = {
+    spec: {
+      startingDeadlineSeconds: scheduleStartingDeadlineSeconds,
+      jobTemplate: {
+        spec: {
+          backoffLimit: 0,
+          activeDeadlineSeconds: backupJobActiveDeadlineSeconds,
+          ttlSecondsAfterFinished: backupJobTtlSecondsAfterFinished
+        }
+      }
+    }
+  };
+  const { stdout, stderr } = await run('kubectl', kubectlArgs(config, ['patch', 'cronjob', '-n', namespace, name, '--type', 'merge', '-p', JSON.stringify(patch)]));
+  return stdout || stderr;
+}
+
+function cronJobSafetyNeedsRefresh(cronjob) {
+  const spec = cronjob.spec || {};
+  const jobSpec = spec.jobTemplate?.spec || {};
+  return spec.startingDeadlineSeconds !== scheduleStartingDeadlineSeconds
+    || jobSpec.backoffLimit !== 0
+    || jobSpec.activeDeadlineSeconds !== backupJobActiveDeadlineSeconds
+    || jobSpec.ttlSecondsAfterFinished !== backupJobTtlSecondsAfterFinished;
+}
+
+async function refreshCronJobPlacement(config, cronjob) {
+  const namespace = cronjob.metadata?.namespace;
+  const name = cronjob.metadata?.name;
+  const pvc = cronjob.metadata?.labels?.['backup-pvc'];
+  if (!namespace || !name || !pvc) return null;
+
+  const safetyChanged = cronJobSafetyNeedsRefresh(cronjob);
+  if (safetyChanged) await patchCronJobSafety(config, namespace, name);
+  const currentNode = cronjob.spec?.jobTemplate?.spec?.template?.spec?.nodeName || '';
+  const desiredNode = await findPvcConsumerNode(config, namespace, pvc);
+  if (currentNode !== desiredNode) await patchCronJobPlacement(config, namespace, name, desiredNode);
+  const replacements = await replaceMisplacedActiveScheduleJobs(config, cronjob, desiredNode);
+  if (!safetyChanged && currentNode === desiredNode && replacements.length === 0) return null;
+
+  return { namespace, name, pvc, previousNode: currentNode || null, nodeName: desiredNode || null, replacements, safetyChanged };
+}
+
+async function replaceMisplacedActiveScheduleJobs(config, cronjob, desiredNode) {
+  if (!desiredNode) return [];
+  const namespace = cronjob.metadata?.namespace;
+  const name = cronjob.metadata?.name;
+  const pvc = cronjob.metadata?.labels?.['backup-pvc'];
+  const activeNames = new Set((cronjob.status?.active || []).map((ref) => ref.name).filter(Boolean));
+  if (!namespace || !name || !pvc || activeNames.size === 0) return [];
+
+  const label = `${appLabelName}=${appLabelValue},${appLabelComponent}=schedule,backup-pvc=${pvc}`;
+  const json = await kubectlJson(config, ['get', 'pods', '-n', namespace, '-l', label]);
+  const misplacedJobs = new Set();
+  for (const pod of json.items || []) {
+    if (pod.metadata?.deletionTimestamp) continue;
+    if (pod.status?.phase !== 'Pending') continue;
+    if (!pod.spec?.nodeName || pod.spec.nodeName === desiredNode) continue;
+    const jobName = pod.metadata?.labels?.['job-name'] || pod.metadata?.labels?.['batch.kubernetes.io/job-name'];
+    if (jobName && activeNames.has(jobName)) misplacedJobs.add(jobName);
+  }
+
+  const replacements = [];
+  for (const jobName of misplacedJobs) {
+    await run('kubectl', kubectlArgs(config, ['delete', 'job', '-n', namespace, jobName, '--ignore-not-found']));
+    if (cronjob.spec?.suspend) {
+      replacements.push({ deleted: jobName, replacement: null });
+      continue;
+    }
+    const replacement = k8sName('retry', name, Date.now().toString().slice(-8));
+    await run('kubectl', kubectlArgs(config, ['create', 'job', '-n', namespace, replacement, `--from=cronjob/${name}`]));
+    replacements.push({ deleted: jobName, replacement });
+  }
+
+  return replacements;
+}
+
+let schedulePlacementRefreshRunning = false;
+
+async function refreshSchedulePlacements() {
+  if (schedulePlacementRefreshRunning) return;
+  schedulePlacementRefreshRunning = true;
+  try {
+    const config = await readConfig();
+    const label = `${appLabelName}=${appLabelValue},${appLabelComponent}=schedule`;
+    const json = await kubectlJson(config, ['get', 'cronjobs', '-A', '-l', label]);
+    const changes = [];
+    for (const cronjob of json.items || []) {
+      const change = await refreshCronJobPlacement(config, cronjob);
+      if (change) changes.push(change);
+    }
+    if (changes.length > 0) {
+      const replacementCount = changes.reduce((sum, item) => sum + item.replacements.length, 0);
+      const safetyCount = changes.filter((item) => item.safetyChanged).length;
+      console.log(`Refreshed qbackup schedules for ${changes.length} CronJob(s)${safetyCount ? `, applied safety limits to ${safetyCount}` : ''}${replacementCount ? `, and replaced ${replacementCount} misplaced active Job(s)` : ''}: ${changes.map((item) => `${item.namespace}/${item.name}${item.nodeName ? ` -> ${item.nodeName}` : ' -> default scheduling'}`).join(', ')}`);
+    }
+  } catch (error) {
+    console.warn(`Failed to refresh qbackup schedule placement: ${error.message || error}`);
+  } finally {
+    schedulePlacementRefreshRunning = false;
   }
 }
 
@@ -1756,10 +1879,11 @@ app.patch('/api/schedules/:namespace/:name', requireAuth('schedules.manage'), as
     const current = await kubectlJson(config, ['get', 'cronjob', '-n', req.params.namespace, req.params.name]);
     const pvc = current.metadata?.labels?.['backup-pvc'];
     const nodeName = pvc ? await findPvcConsumerNode(config, req.params.namespace, pvc) : '';
-    if (nodeName) spec.jobTemplate = { spec: { template: { spec: { nodeName } } } };
     if (Object.keys(spec).length === 0) return res.status(400).json({ error: 'No schedule changes supplied.' });
     const patch = JSON.stringify({ spec });
     const { stdout, stderr } = await run('kubectl', kubectlArgs(config, ['patch', 'cronjob', '-n', req.params.namespace, req.params.name, '--type', 'merge', '-p', patch]));
+    await patchCronJobSafety(config, req.params.namespace, req.params.name);
+    await patchCronJobPlacement(config, req.params.namespace, req.params.name, nodeName);
     await logAudit('schedules.update', req.user.id, { namespace: req.params.namespace, name: req.params.name, ...spec });
     res.json({ output: stdout || stderr });
   } catch (error) {
@@ -1774,10 +1898,8 @@ app.post('/api/schedules/:namespace/:name/run', requireAuth('schedules.manage'),
     const pvc = current.metadata?.labels?.['backup-pvc'];
     if (pvc) await assertNotQbackupInternalPvc(config, req.params.namespace, pvc);
     const nodeName = pvc ? await findPvcConsumerNode(config, req.params.namespace, pvc) : '';
-    if (nodeName) {
-      const patch = JSON.stringify({ spec: { jobTemplate: { spec: { template: { spec: { nodeName } } } } } });
-      await run('kubectl', kubectlArgs(config, ['patch', 'cronjob', '-n', req.params.namespace, req.params.name, '--type', 'merge', '-p', patch]));
-    }
+    await patchCronJobSafety(config, req.params.namespace, req.params.name);
+    await patchCronJobPlacement(config, req.params.namespace, req.params.name, nodeName);
     const jobName = k8sName('manual', req.params.name, Date.now().toString().slice(-8));
     const { stdout, stderr } = await run('kubectl', kubectlArgs(config, ['create', 'job', '-n', req.params.namespace, jobName, `--from=cronjob/${req.params.name}`]));
     await logAudit('schedules.run', req.user.id, { namespace: req.params.namespace, cronjob: req.params.name, job: jobName });
@@ -2200,4 +2322,6 @@ app.use((error, _req, res, _next) => {
 
 app.listen(port, () => {
   console.log(`qbackup API listening on http://localhost:${port}`);
+  refreshSchedulePlacements();
+  setInterval(refreshSchedulePlacements, schedulePlacementRefreshMs).unref();
 });
