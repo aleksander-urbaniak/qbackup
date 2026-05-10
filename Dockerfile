@@ -11,16 +11,28 @@ RUN npm prune --omit=dev
 FROM node:25-bookworm-slim AS runtime
 WORKDIR /app
 
+ARG KUBECTL_VERSION=v1.30.0
+
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl kubernetes-client \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+  arch="$(dpkg --print-architecture)"; \
+  case "$arch" in \
+    amd64) kubectl_arch=amd64 ;; \
+    arm64) kubectl_arch=arm64 ;; \
+    *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+  esac; \
+  curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${kubectl_arch}/kubectl"; \
+  chmod +x /usr/local/bin/kubectl; \
+  kubectl version --client=true
 
 ENV NODE_ENV=production \
     PORT=8787 \
     HOME=/data \
     XDG_CONFIG_HOME=/data/.config \
-    XDG_DATA_HOME=/data/.local/share \
-    KUBECONFIG=/data/.kube/config
+    XDG_DATA_HOME=/data/.local/share
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
