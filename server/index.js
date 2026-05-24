@@ -717,6 +717,38 @@ function podPlacementYaml(nodeName, indent) {
   return nodeName ? `${' '.repeat(indent)}nodeName: ${yamlString(nodeName)}\n` : '';
 }
 
+function indentBlock(text, spaces) {
+  const padding = ' '.repeat(spaces);
+  return text.split('\n').map((line) => `${padding}${line}`).join('\n');
+}
+
+function backupArchiveShellScript({ echoArchive = false, retentionMaxDepth = false } = {}) {
+  const retentionDepth = retentionMaxDepth ? ' -maxdepth 1' : '';
+  const echoArchiveLine = echoArchive ? '\necho "archive=${archive}"' : '';
+  return `set -euo pipefail
+stamp="$(date +%Y%m%d%H%M%S)"
+target="/backup/\${BACKUP_ROOT}/\${CLUSTER_NAME}/\${PVC_NAMESPACE}/\${PVC_NAME}"
+archive="$target/\${stamp}.\${ARCHIVE_EXTENSION}"
+tar_log="$(mktemp)"
+mkdir -p "$target"
+set +e
+tar -czf "$archive" -C /source . 2>"$tar_log"
+tar_rc=$?
+set -e
+if [ "$tar_rc" -ne 0 ]; then
+  cat "$tar_log" >&2
+  if [ ! -s "$archive" ] || [ ! -s "$tar_log" ] || grep -Ev '(^tar: \\./.*: No such file or directory$|^tar: .*: file changed as we read it$|^tar: error exit delayed from previous errors$)' "$tar_log" >/dev/null; then
+    rm -f "$archive" "$tar_log"
+    exit "$tar_rc"
+  fi
+  echo "qbackup: continuing after transient filesystem changes while creating $archive" >&2
+fi
+rm -f "$tar_log"
+if [ "$ENABLE_RETENTION" = "true" ]; then
+  find "$target"${retentionDepth} -type f -name "*.\${ARCHIVE_EXTENSION}" -mtime "+\${RETENTION_DAYS}" -delete
+fi${echoArchiveLine}`;
+}
+
 async function findPvcConsumerNode(config, namespace, pvc) {
   const json = await kubectlJson(config, ['get', 'pods', '-n', namespace]);
   const candidates = (json.items || []).filter((pod) => {
@@ -907,14 +939,7 @@ ${podPlacementYaml(nodeName, 10)}          restartPolicy: Never
               command: ["/bin/sh", "-ceu"]
               args:
                 - |
-                  set -euo pipefail
-                  stamp="$(date +%Y%m%d%H%M%S)"
-                  target="/backup/\${BACKUP_ROOT}/\${CLUSTER_NAME}/\${PVC_NAMESPACE}/\${PVC_NAME}"
-                  mkdir -p "$target"
-                  tar -czf "$target/\${stamp}.\${ARCHIVE_EXTENSION}" -C /source .
-                  if [ "$ENABLE_RETENTION" = "true" ]; then
-                    find "$target" -type f -name "*.\${ARCHIVE_EXTENSION}" -mtime "+\${RETENTION_DAYS}" -delete
-                  fi
+${indentBlock(backupArchiveShellScript(), 18)}
               env:
                 - name: BACKUP_ROOT
                   value: ${yamlString(config.backupRoot)}
@@ -1120,15 +1145,7 @@ ${podPlacementYaml(nodeName, 2)}  restartPolicy: Never
       command: ["/bin/sh", "-ceu"]
       args:
         - |
-          set -euo pipefail
-          stamp="$(date +%Y%m%d%H%M%S)"
-          target="/backup/\${BACKUP_ROOT}/\${CLUSTER_NAME}/\${PVC_NAMESPACE}/\${PVC_NAME}"
-          mkdir -p "$target"
-          tar -czf "$target/\${stamp}.\${ARCHIVE_EXTENSION}" -C /source .
-          if [ "$ENABLE_RETENTION" = "true" ]; then
-            find "$target" -maxdepth 1 -type f -name "*.\${ARCHIVE_EXTENSION}" -mtime "+\${RETENTION_DAYS}" -delete
-          fi
-          echo "archive=\${target}/\${stamp}.\${ARCHIVE_EXTENSION}"
+${indentBlock(backupArchiveShellScript({ echoArchive: true, retentionMaxDepth: true }), 10)}
       env:
         - name: BACKUP_ROOT
           value: ${yamlString(config.backupRoot)}
