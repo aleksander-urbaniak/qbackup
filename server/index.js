@@ -1317,6 +1317,12 @@ spec:
           fi
           touch /work/ready
           sleep 300
+      readinessProbe:
+        exec:
+          command: ["test", "-f", "/work/ready"]
+        periodSeconds: 1
+        timeoutSeconds: 1
+        failureThreshold: 600
       env:
         - name: BACKUP_ROOT
           value: ${yamlString(config.backupRoot)}
@@ -1391,7 +1397,7 @@ spec:
 `;
 }
 
-function liveFileHelperPodManifest(config, namespace, pvc, podName, readOnly = true) {
+function liveFileHelperPodManifest(config, namespace, pvc, podName, readOnly = true, nodeName = '') {
   return `apiVersion: v1
 kind: Pod
 metadata:
@@ -1402,7 +1408,7 @@ metadata:
     ${appLabelComponent}: live-file-explorer
     backup-pvc: ${pvc}
 spec:
-  restartPolicy: Never
+${podPlacementYaml(nodeName, 2)}  restartPolicy: Never
   containers:
     - name: explorer
       image: ${yamlString(config.helperImage)}
@@ -1412,6 +1418,12 @@ spec:
         - |
           touch /tmp/ready
           sleep 600
+      readinessProbe:
+        exec:
+          command: ["test", "-f", "/tmp/ready"]
+        periodSeconds: 1
+        timeoutSeconds: 1
+        failureThreshold: 120
       volumeMounts:
         - name: target
           mountPath: /target
@@ -1424,7 +1436,7 @@ spec:
 `;
 }
 
-function liveFileDownloadPodManifest(config, namespace, pvc, selectedPath, podName) {
+function liveFileDownloadPodManifest(config, namespace, pvc, selectedPath, podName, nodeName = '') {
   return `apiVersion: v1
 kind: Pod
 metadata:
@@ -1435,7 +1447,7 @@ metadata:
     ${appLabelComponent}: live-file-download
     backup-pvc: ${pvc}
 spec:
-  restartPolicy: Never
+${podPlacementYaml(nodeName, 2)}  restartPolicy: Never
   containers:
     - name: download
       image: ${yamlString(config.helperImage)}
@@ -1457,6 +1469,12 @@ spec:
           fi
           touch /work/ready
           sleep 300
+      readinessProbe:
+        exec:
+          command: ["test", "-f", "/work/ready"]
+        periodSeconds: 1
+        timeoutSeconds: 1
+        failureThreshold: 600
       env:
         - name: SELECTED_PATH
           value: ${yamlString(selectedPath)}
@@ -1497,6 +1515,10 @@ async function waitForPodCompletion(config, namespace, podName, append = () => {
   return 'Timeout';
 }
 
+function podConditionStatus(pod, type) {
+  return (pod?.status?.conditions || []).find((condition) => condition.type === type)?.status || '';
+}
+
 async function runHelperPod(config, namespace, manifest, podName, append = () => {}, timeoutSeconds = 1800) {
   append(`[${new Date().toISOString()}] Creating helper Pod ${namespace}/${podName}\n`);
   append(await applyManifest(config, manifest));
@@ -1517,8 +1539,7 @@ async function waitForFileRestoreReady(config, namespace, podName, timeoutSecond
       const logs = await run('kubectl', kubectlArgs(config, ['logs', '-n', namespace, podName])).then((result) => result.stdout || result.stderr).catch(() => '');
       throw new Error(logs || `File restore helper finished before the zip was ready with phase=${phase}`);
     }
-    const ready = await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'test', '-f', '/work/ready'])).then(() => true).catch(() => false);
-    if (ready) return;
+    if (podConditionStatus(pod, 'Ready') === 'True') return;
     await new Promise((resolve) => setTimeout(resolve, 2000));
   }
   throw new Error(`Timed out waiting for file restore helper ${namespace}/${podName}`);
@@ -1533,8 +1554,7 @@ async function waitForLiveFileHelperReady(config, namespace, podName, timeoutSec
       const logs = await run('kubectl', kubectlArgs(config, ['logs', '-n', namespace, podName])).then((result) => result.stdout || result.stderr).catch(() => '');
       throw new Error(logs || `Live file helper finished before it was ready with phase=${phase}`);
     }
-    const ready = await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'test', '-f', '/tmp/ready'])).then(() => true).catch(() => false);
-    if (ready) return;
+    if (podConditionStatus(pod, 'Ready') === 'True') return;
     await new Promise((resolve) => setTimeout(resolve, 1500));
   }
   throw new Error(`Timed out waiting for live file helper ${namespace}/${podName}`);
@@ -1542,7 +1562,8 @@ async function waitForLiveFileHelperReady(config, namespace, podName, timeoutSec
 
 async function withLiveFileHelper(config, namespace, pvc, readOnly, callback) {
   const podName = k8sName('live-files', pvc, Date.now().toString().slice(-10));
-  await applyManifest(config, liveFileHelperPodManifest(config, namespace, pvc, podName, readOnly));
+  const nodeName = await findPvcConsumerNode(config, namespace, pvc);
+  await applyManifest(config, liveFileHelperPodManifest(config, namespace, pvc, podName, readOnly, nodeName));
   try {
     await waitForLiveFileHelperReady(config, namespace, podName);
     return await callback(podName);
@@ -2270,7 +2291,8 @@ app.post('/api/live-files/download', requireAuth('files.manage'), async (req, re
     namespace = pvcNamespace;
     if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
     podName = k8sName('live-download', pvcName, Date.now().toString().slice(-10));
-    await applyManifest(config, liveFileDownloadPodManifest(config, namespace, pvcName, selectedPath, podName));
+    const nodeName = await findPvcConsumerNode(config, namespace, pvcName);
+    await applyManifest(config, liveFileDownloadPodManifest(config, namespace, pvcName, selectedPath, podName, nodeName));
     await waitForFileRestoreReady(config, namespace, podName);
     const filename = zipDownloadName(pvcName, 'live-files.tgz', selectedPath);
     await logAudit('live-files.download', req.user.id, { pvc, path: selectedPath, filename });
