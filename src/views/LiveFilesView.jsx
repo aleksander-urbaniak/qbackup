@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from 'react';
-import Editor from '@monaco-editor/react';
 import { ChevronDown, ChevronRight, Download, File, FilePlus, Folder, FolderPlus, HardDrive, Pencil, RefreshCw, Save, ShieldAlert, Trash2, X } from 'lucide-react';
 import { api, apiBlob } from '../lib/api';
 import { StyledSelect } from '../components/shared';
@@ -309,13 +308,12 @@ export default function LiveFilesView({ notify }) {
             </button>
           </div>
           <div className="min-h-0 flex-1">
-            <Editor
-              height="100%"
-              theme="vs-dark"
-              path={openFile || 'empty.txt'}
+            <textarea
+              spellCheck={false}
+              disabled={!openFile}
               value={openFile ? content : ''}
-              onChange={(value) => setContent(value || '')}
-              options={{ readOnly: !openFile, minimap: { enabled: false }, fontSize: 13, wordWrap: 'on', scrollBeyondLastLine: false }}
+              onChange={(event) => setContent(event.target.value)}
+              className="h-full w-full resize-none border-0 bg-[#05080f] p-4 font-mono text-[13px] leading-5 text-slate-100 outline-none placeholder:text-slate-600 disabled:cursor-default disabled:text-slate-500"
             />
           </div>
         </section>
