@@ -153,6 +153,16 @@ textarea {
   color: rgb(var(--muted)) !important;
 }
 
+.qbackup-live-monaco .monaco-editor,
+.qbackup-live-monaco .monaco-editor-background,
+.qbackup-live-monaco .monaco-editor .margin {
+  background-color: #05080f !important;
+}
+
+.qbackup-live-monaco .monaco-editor .margin-view-overlays .folding {
+  opacity: 1;
+}
+
 .qbackup-app tr:hover {
   background-color: rgb(var(--accent) / 0.06) !important;
 }

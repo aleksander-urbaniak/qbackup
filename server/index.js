@@ -2135,7 +2135,20 @@ app.post('/api/live-files/read', requireAuth('files.manage'), async (req, res, n
     const [namespace, pvcName] = String(pvc || '').split('/');
     if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
     const content = await withLiveFileHelper(config, namespace, pvcName, true, async (podName) => {
-      const script = 'file="/target/$FILE_PATH"; test -f "$file"; cat "$file"';
+      const script = `
+        file="/target/$FILE_PATH"
+        test -f "$file"
+        size="$(stat -c "%s" "$file")"
+        if [ "$size" -gt 1048576 ]; then
+          echo "Files larger than 1 MiB are download-only." >&2
+          exit 4
+        fi
+        if [ "$size" -gt 0 ] && ! grep -Iq . "$file"; then
+          echo "Binary files are download-only." >&2
+          exit 5
+        fi
+        cat "$file"
+      `;
       const { stdout } = await run('kubectl', kubectlArgs(config, ['exec', '-n', namespace, podName, '--', 'env', `FILE_PATH=${selectedPath}`, 'sh', '-ceu', script]));
       return stdout;
     });

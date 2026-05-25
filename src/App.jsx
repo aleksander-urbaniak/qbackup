@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import { Activity, ChevronRight, Clock, Files, HardDrive, LogOut, Menu, RotateCcw, Settings, Users } from 'lucide-react';
 import { api } from './lib/api';
 import { emptySettings } from './lib/settings';
@@ -12,7 +12,8 @@ import RestoreView from './views/RestoreView';
 import LogsView from './views/LogsView';
 import UsersView from './views/UsersView';
 import ProfileView from './views/ProfileView';
-import LiveFilesView from './views/LiveFilesView';
+
+const LiveFilesView = lazy(() => import('./views/LiveFilesView'));
 
 const validTabs = new Set(['pvcs', 'schedules', 'restore', 'live-files', 'logs', 'users', 'settings', 'profile']);
 const pathToTab = {
@@ -256,7 +257,11 @@ export default function App() {
           {activeTab === 'settings' && <SettingsView settings={settings} setSettings={setSettings} notify={notify} refreshConfig={refreshConfig} />}
           {activeTab === 'schedules' && <SchedulesView settings={settings} notify={notify} />}
           {activeTab === 'restore' && <RestoreView notify={notify} startJobStream={startJobStream} />}
-          {activeTab === 'live-files' && canUseLiveFiles && <LiveFilesView notify={notify} />}
+          {activeTab === 'live-files' && canUseLiveFiles && (
+            <Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-slate-500">Loading live editor...</div>}>
+              <LiveFilesView notify={notify} />
+            </Suspense>
+          )}
           {activeTab === 'logs' && <LogsView jobs={jobs} canReadAudit={user.permissions?.includes('audit.read')} notify={notify} />}
           {activeTab === 'users' && user.permissions?.includes('users.manage') && <UsersView currentUser={user} notify={notify} />}
           {activeTab === 'profile' && <ProfileView user={user} setUser={setUser} notify={notify} />}
