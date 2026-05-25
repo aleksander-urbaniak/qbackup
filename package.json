@@ -9,7 +9,8 @@
     "server": "node server/index.js",
     "start": "node server/index.js",
     "build": "vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "smoke:prod": "node scripts/prod-smoke.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
@@ -23,6 +24,7 @@
     "vite": "^7.1.12"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "autoprefixer": "^10.4.21",
     "postcss": "^8.5.14",
     "tailwindcss": "^3.4.19"
