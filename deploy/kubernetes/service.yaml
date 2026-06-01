@@ -3,6 +3,10 @@ kind: Service
 metadata:
   name: qbackup
   namespace: qbackup
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+    prometheus.io/port: "80"
 spec:
   type: ClusterIP
   selector:

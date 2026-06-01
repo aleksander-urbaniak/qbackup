@@ -65,8 +65,38 @@ const schedulePlacementRefreshMs = 60 * 1000;
 const scheduleStartingDeadlineSeconds = 15 * 60;
 const backupJobActiveDeadlineSeconds = 2 * 60 * 60;
 const backupJobTtlSecondsAfterFinished = 24 * 60 * 60;
+const autoHealIntervalMs = Number.parseInt(process.env.AUTO_HEAL_INTERVAL_MS || '30000', 10);
+const autoHealRetryAnnotation = 'qbackup.io/autoheal-retries';
+const autoHealParentAnnotation = 'qbackup.io/autoheal-parent';
+const autoHealOriginalNameAnnotation = 'qbackup.io/autoheal-original-name';
 const jobs = new Map();
 const rateBuckets = new Map();
+const metricsState = {
+  startedAt: Date.now(),
+  httpRequests: new Map(),
+  httpDurations: new Map(),
+  autoHeal: {
+    running: false,
+    enabled: false,
+    maxRetries: 0,
+    runs: 0,
+    actions: new Map(),
+    exhausted: new Map(),
+    exhaustedResources: new Set(),
+    lastRunAt: null,
+    lastSuccess: false,
+    lastError: ''
+  },
+  cluster: {
+    lastScrapeAt: null,
+    lastSuccess: false,
+    lastError: '',
+    pods: [],
+    jobs: [],
+    schedules: []
+  }
+};
+const httpDurationBuckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
 
 function envString(key, fallback) {
   return process.env[key] ?? fallback;
@@ -97,7 +127,9 @@ const defaults = {
   scaleConsumers: envBool('SCALE_CONSUMERS_FOR_BACKUP', true),
   archiveExtension: envString('ARCHIVE_EXTENSION', 'tgz'),
   localNfsPreflight: envString('LOCAL_NFS_PREFLIGHT', 'mount'),
-  liveFileExplorerEnabled: envBool('LIVE_FILE_EXPLORER_ENABLED', false)
+  liveFileExplorerEnabled: envBool('LIVE_FILE_EXPLORER_ENABLED', false),
+  autoHealEnabled: envBool('AUTO_HEAL_ENABLED', false),
+  autoHealRetries: normalizeAutoHealRetries(envString('AUTO_HEAL_RETRIES', '2'))
 };
 
 if (['true', '1', 'yes'].includes(String(process.env.QBACKUP_TRUST_PROXY || '').toLowerCase())) {
@@ -204,6 +236,38 @@ function rateLimit({ windowMs, max, keyPrefix }) {
   };
 }
 
+function incrementMetric(map, labels, amount = 1) {
+  const key = JSON.stringify(labels);
+  map.set(key, (map.get(key) || 0) + amount);
+}
+
+function routeLabel(req) {
+  if (req.path.startsWith('/api/jobs/')) return '/api/jobs/:id';
+  if (req.path.startsWith('/events/jobs/')) return '/events/jobs/:id';
+  if (req.path.startsWith('/api/schedules/')) return '/api/schedules/:namespace/:name';
+  if (req.path.startsWith('/api/archives/')) return '/api/archives/:namespace/:pvc';
+  return req.path || '/';
+}
+
+function observeHttpRequest(req, res, seconds) {
+  const labels = { method: req.method, route: routeLabel(req), status: String(res.statusCode) };
+  incrementMetric(metricsState.httpRequests, labels);
+  for (const le of httpDurationBuckets) {
+    if (seconds <= le) incrementMetric(metricsState.httpDurations, { ...labels, le: String(le) });
+  }
+  incrementMetric(metricsState.httpDurations, { ...labels, le: '+Inf' });
+  incrementMetric(metricsState.httpDurations, { ...labels, le: '_sum' }, seconds);
+}
+
+function metricsMiddleware(req, res, next) {
+  const started = process.hrtime.bigint();
+  res.on('finish', () => {
+    const seconds = Number(process.hrtime.bigint() - started) / 1e9;
+    observeHttpRequest(req, res, seconds);
+  });
+  next();
+}
+
 async function attachUser(req, _res, next) {
   try {
     const cookies = parseCookies(req);
@@ -231,6 +295,7 @@ function requireAuth(permission = 'dashboard.read') {
 }
 
 app.use(attachUser);
+app.use(metricsMiddleware);
 app.use(csrfProtection);
 
 function envKeyToSetting(key) {
@@ -250,7 +315,9 @@ function envKeyToSetting(key) {
     SCALE_CONSUMERS_FOR_BACKUP: 'scaleConsumers',
     ARCHIVE_EXTENSION: 'archiveExtension',
     LOCAL_NFS_PREFLIGHT: 'localNfsPreflight',
-    LIVE_FILE_EXPLORER_ENABLED: 'liveFileExplorerEnabled'
+    LIVE_FILE_EXPLORER_ENABLED: 'liveFileExplorerEnabled',
+    AUTO_HEAL_ENABLED: 'autoHealEnabled',
+    AUTO_HEAL_RETRIES: 'autoHealRetries'
   }[key];
 }
 
@@ -261,6 +328,11 @@ function boolFromEnv(value) {
 function normalizeBackupConcurrency(value) {
   const parsed = Number.parseInt(String(value ?? defaults.backupConcurrency), 10);
   return String(Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), 20) : 1);
+}
+
+function normalizeAutoHealRetries(value) {
+  const parsed = Number.parseInt(String(value ?? '2'), 10);
+  return String(Number.isFinite(parsed) ? Math.min(Math.max(parsed, 0), 10) : 2);
 }
 
 function assertClusterConfig(config) {
@@ -287,6 +359,11 @@ function assertClusterConfig(config) {
   }
   if (!['mount', 'skip'].includes(config.localNfsPreflight)) {
     const error = new Error('Local NFS preflight must be mount or skip.');
+    error.status = 400;
+    throw error;
+  }
+  if (!/^\d+$/.test(String(config.autoHealRetries || ''))) {
+    const error = new Error('Auto-heal retries must be a whole number between 0 and 10.');
     error.status = 400;
     throw error;
   }
@@ -333,6 +410,8 @@ function normalizeCluster(input = {}, fallback = defaults) {
   config.keepFailedPods = Boolean(config.keepFailedPods);
   config.scaleConsumers = input.scaleConsumers === undefined ? Boolean(config.scaleConsumers) : Boolean(input.scaleConsumers);
   config.liveFileExplorerEnabled = input.liveFileExplorerEnabled === undefined ? Boolean(config.liveFileExplorerEnabled) : Boolean(input.liveFileExplorerEnabled);
+  config.autoHealEnabled = input.autoHealEnabled === undefined ? Boolean(config.autoHealEnabled) : Boolean(input.autoHealEnabled);
+  config.autoHealRetries = normalizeAutoHealRetries(config.autoHealRetries);
   config.localNfsPreflight = config.localNfsPreflight || 'mount';
   config.id = String(input.id || input.clusterId || clusterIdFromConfig(config));
   if (input.kubeconfigContent) config.kubeconfigContent = String(input.kubeconfigContent);
@@ -375,8 +454,9 @@ async function readEnvConfig() {
       let value = match[2].trim();
       if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1).replaceAll("'\\''", "'");
       if (setting === 'activeClusterId') config[setting] = value;
-      else if (setting === 'keepFailedPods' || setting === 'scaleConsumers' || setting === 'liveFileExplorerEnabled') config[setting] = boolFromEnv(value);
+      else if (setting === 'keepFailedPods' || setting === 'scaleConsumers' || setting === 'liveFileExplorerEnabled' || setting === 'autoHealEnabled') config[setting] = boolFromEnv(value);
       else if (setting === 'backupConcurrency') config[setting] = normalizeBackupConcurrency(value);
+      else if (setting === 'autoHealRetries') config[setting] = normalizeAutoHealRetries(value);
       else config[setting] = value;
     }
   } catch (error) {
@@ -405,6 +485,8 @@ async function writeEnvConfig(input) {
     ['ARCHIVE_EXTENSION', config.archiveExtension],
     ['LOCAL_NFS_PREFLIGHT', config.localNfsPreflight || 'mount'],
     ['LIVE_FILE_EXPLORER_ENABLED', config.liveFileExplorerEnabled ? 'true' : 'false'],
+    ['AUTO_HEAL_ENABLED', config.autoHealEnabled ? 'true' : 'false'],
+    ['AUTO_HEAL_RETRIES', normalizeAutoHealRetries(config.autoHealRetries)],
     ['SCALE_CONSUMERS_FOR_BACKUP', config.scaleConsumers ? 'true' : 'false']
   ].map(([key, value]) => `${key}=${shellQuote(value ?? '')}`);
   const tempFile = `${configFile}.${process.pid}.${Date.now()}.tmp`;
@@ -920,6 +1002,9 @@ spec:
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
   jobTemplate:
+    metadata:
+      annotations:
+        ${autoHealParentAnnotation}: ${cronjobName}
     spec:
       backoffLimit: 0
       activeDeadlineSeconds: ${backupJobActiveDeadlineSeconds}
@@ -982,6 +1067,19 @@ async function applyManifest(config, manifest) {
   } finally {
     await fs.rm(temp, { force: true });
   }
+}
+
+async function annotateAutoHealParent(config, namespace, kind, name, parentName) {
+  const patch = JSON.stringify({
+    metadata: {
+      annotations: {
+        [autoHealParentAnnotation]: parentName,
+        [autoHealRetryAnnotation]: '0',
+        [autoHealOriginalNameAnnotation]: name
+      }
+    }
+  });
+  await run('kubectl', kubectlArgs(config, ['patch', kind, '-n', namespace, name, '--type', 'merge', '-p', patch])).catch(() => null);
 }
 
 async function patchCronJobPlacement(config, namespace, name, nodeName) {
@@ -1068,6 +1166,7 @@ async function replaceMisplacedActiveScheduleJobs(config, cronjob, desiredNode) 
     }
     const replacement = k8sName('retry', name, Date.now().toString().slice(-8));
     await run('kubectl', kubectlArgs(config, ['create', 'job', '-n', namespace, replacement, `--from=cronjob/${name}`]));
+    await annotateAutoHealParent(config, namespace, 'job', replacement, name);
     replacements.push({ deleted: jobName, replacement });
   }
 
@@ -1520,14 +1619,168 @@ function podConditionStatus(pod, type) {
 }
 
 async function runHelperPod(config, namespace, manifest, podName, append = () => {}, timeoutSeconds = 1800) {
-  append(`[${new Date().toISOString()}] Creating helper Pod ${namespace}/${podName}\n`);
-  append(await applyManifest(config, manifest));
-  const phase = await waitForPodCompletion(config, namespace, podName, append, timeoutSeconds);
-  const logs = await run('kubectl', kubectlArgs(config, ['logs', '-n', namespace, podName])).then((result) => result.stdout || result.stderr).catch((error) => error.stdout || error.stderr || '');
-  if (logs) append(logs.endsWith('\n') ? logs : `${logs}\n`);
-  await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, podName, '--ignore-not-found', '--wait=false'])).catch(() => null);
-  if (phase !== 'Succeeded') throw new Error(`Helper Pod ${namespace}/${podName} finished with phase=${phase}`);
-  return logs;
+  const maxRetries = Boolean(config.autoHealEnabled) ? Number.parseInt(normalizeAutoHealRetries(config.autoHealRetries), 10) : 0;
+  let attempt = 0;
+  let lastError = null;
+  while (attempt <= maxRetries) {
+    const attemptPodName = attempt === 0 ? podName : k8sName('retry', podName, `${attempt}-${Date.now().toString().slice(-6)}`);
+    const attemptManifest = manifest.replace(new RegExp(`name: ${podName}\\n  namespace: ${namespace}`), `name: ${attemptPodName}\n  namespace: ${namespace}`);
+    append(`[${new Date().toISOString()}] Creating helper Pod ${namespace}/${attemptPodName}${attempt ? ` (auto-heal retry ${attempt}/${maxRetries})` : ''}\n`);
+    append(await applyManifest(config, attemptManifest));
+    const phase = await waitForPodCompletion(config, namespace, attemptPodName, append, timeoutSeconds);
+    const logs = await run('kubectl', kubectlArgs(config, ['logs', '-n', namespace, attemptPodName])).then((result) => result.stdout || result.stderr).catch((error) => error.stdout || error.stderr || '');
+    if (logs) append(logs.endsWith('\n') ? logs : `${logs}\n`);
+    await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, attemptPodName, '--ignore-not-found', '--wait=false'])).catch(() => null);
+    if (phase === 'Succeeded') return logs;
+    lastError = new Error(`Helper Pod ${namespace}/${attemptPodName} finished with phase=${phase}`);
+    incrementMetric(metricsState.autoHeal.actions, { kind: 'helper_pod', result: attempt < maxRetries ? 'retry' : 'failed' });
+    if (attempt >= maxRetries) break;
+    append(`[${new Date().toISOString()}] Auto-heal will replace failed helper Pod ${namespace}/${attemptPodName}\n`, 'stderr');
+    attempt += 1;
+  }
+  throw lastError || new Error(`Helper Pod ${namespace}/${podName} failed`);
+}
+
+function resourceRetryCount(resource) {
+  return Number.parseInt(resource?.metadata?.annotations?.[autoHealRetryAnnotation] || '0', 10) || 0;
+}
+
+function ownerKind(resource, kind) {
+  return (resource?.metadata?.ownerReferences || []).find((owner) => owner.kind === kind);
+}
+
+function autoHealExhausted(kind, resourceId = '') {
+  const key = `${kind}:${resourceId}`;
+  if (metricsState.autoHeal.exhaustedResources.has(key)) return;
+  metricsState.autoHeal.exhaustedResources.add(key);
+  incrementMetric(metricsState.autoHeal.exhausted, { kind });
+}
+
+async function recreateStandalonePod(config, pod, retries) {
+  const namespace = pod.metadata?.namespace;
+  const currentName = pod.metadata?.name;
+  const nextName = k8sName('heal', currentName, Date.now().toString().slice(-8));
+  const manifest = {
+    apiVersion: 'v1',
+    kind: 'Pod',
+    metadata: {
+      name: nextName,
+      namespace,
+      labels: pod.metadata?.labels || {},
+      annotations: {
+        ...(pod.metadata?.annotations || {}),
+        [autoHealRetryAnnotation]: String(retries + 1),
+        [autoHealOriginalNameAnnotation]: pod.metadata?.annotations?.[autoHealOriginalNameAnnotation] || currentName
+      }
+    },
+    spec: pod.spec
+  };
+  delete manifest.spec.nodeName;
+  delete manifest.spec.restartPolicy;
+  manifest.spec.restartPolicy = 'Never';
+  await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, currentName, '--ignore-not-found', '--wait=false']));
+  await runWithInput('kubectl', kubectlArgs(config, ['apply', '-f', '-']), JSON.stringify(manifest));
+  return nextName;
+}
+
+async function createReplacementJobFromCronJob(config, job, retries) {
+  const namespace = job.metadata?.namespace;
+  const currentName = job.metadata?.name;
+  const parentName = jobParentName(job);
+  const replacement = k8sName('heal', parentName, Date.now().toString().slice(-8));
+  await run('kubectl', kubectlArgs(config, ['delete', 'job', '-n', namespace, currentName, '--ignore-not-found']));
+  await run('kubectl', kubectlArgs(config, ['create', 'job', '-n', namespace, replacement, `--from=cronjob/${parentName}`]));
+  const patch = JSON.stringify({
+    metadata: {
+      annotations: {
+        [autoHealRetryAnnotation]: String(retries + 1),
+        [autoHealParentAnnotation]: parentName,
+        [autoHealOriginalNameAnnotation]: job.metadata?.annotations?.[autoHealOriginalNameAnnotation] || currentName
+      }
+    }
+  });
+  await run('kubectl', kubectlArgs(config, ['patch', 'job', '-n', namespace, replacement, '--type', 'merge', '-p', patch]));
+  return replacement;
+}
+
+function jobParentName(job) {
+  const currentName = job.metadata?.name || '';
+  const cronOwner = ownerKind(job, 'CronJob');
+  return job.metadata?.annotations?.[autoHealParentAnnotation] || cronOwner?.name || currentName.replace(/-\d+$/, '');
+}
+
+async function autoHealBackupPods(config, maxRetries) {
+  const label = `${appLabelName}=${appLabelValue}`;
+  const json = await kubectlJson(config, ['get', 'pods', '-A', '-l', label]);
+  for (const pod of json.items || []) {
+    const component = pod.metadata?.labels?.[appLabelComponent] || '';
+    if (!['on-demand-backup', 'schedule'].includes(component)) continue;
+    if (pod.metadata?.deletionTimestamp || pod.status?.phase !== 'Failed') continue;
+    if (ownerKind(pod, 'Job')) continue;
+    const retries = resourceRetryCount(pod);
+    if (retries >= maxRetries) {
+      autoHealExhausted('pod', `${pod.metadata?.namespace}/${pod.metadata?.name}`);
+      continue;
+    }
+    try {
+      await recreateStandalonePod(config, pod, retries);
+      incrementMetric(metricsState.autoHeal.actions, { kind: 'pod', result: 'recreated' });
+    } catch (error) {
+      incrementMetric(metricsState.autoHeal.actions, { kind: 'pod', result: 'error' });
+      throw error;
+    }
+  }
+}
+
+async function autoHealBackupJobs(config, maxRetries) {
+  const label = `${appLabelName}=${appLabelValue},${appLabelComponent}=schedule`;
+  const json = await kubectlJson(config, ['get', 'jobs', '-A', '-l', label]);
+  const activeKeys = new Set((json.items || [])
+    .filter((job) => Number(job.status?.active || 0) > 0)
+    .map((job) => `${job.metadata?.namespace}/${jobParentName(job)}/${job.metadata?.labels?.['backup-pvc'] || ''}`));
+  for (const job of json.items || []) {
+    if (job.metadata?.deletionTimestamp || Number(job.status?.failed || 0) < 1) continue;
+    const activeKey = `${job.metadata?.namespace}/${jobParentName(job)}/${job.metadata?.labels?.['backup-pvc'] || ''}`;
+    if (activeKeys.has(activeKey)) continue;
+    const retries = resourceRetryCount(job);
+    if (retries >= maxRetries) {
+      autoHealExhausted('job', `${job.metadata?.namespace}/${job.metadata?.name}`);
+      continue;
+    }
+    try {
+      await createReplacementJobFromCronJob(config, job, retries);
+      incrementMetric(metricsState.autoHeal.actions, { kind: 'job', result: 'recreated' });
+    } catch (error) {
+      incrementMetric(metricsState.autoHeal.actions, { kind: 'job', result: 'error' });
+      throw error;
+    }
+  }
+}
+
+async function runAutoHeal() {
+  if (metricsState.autoHeal.running) return;
+  metricsState.autoHeal.running = true;
+  metricsState.autoHeal.runs += 1;
+  try {
+    const config = await readConfig();
+    const maxRetries = Number.parseInt(normalizeAutoHealRetries(config.autoHealRetries), 10);
+    metricsState.autoHeal.enabled = Boolean(config.autoHealEnabled);
+    metricsState.autoHeal.maxRetries = maxRetries;
+    if ((config.clusterId || config.id) && config.autoHealEnabled && maxRetries > 0) {
+      await autoHealBackupJobs(config, maxRetries);
+      await autoHealBackupPods(config, maxRetries);
+    }
+    metricsState.autoHeal.lastRunAt = new Date().toISOString();
+    metricsState.autoHeal.lastSuccess = true;
+    metricsState.autoHeal.lastError = '';
+  } catch (error) {
+    metricsState.autoHeal.lastRunAt = new Date().toISOString();
+    metricsState.autoHeal.lastSuccess = false;
+    metricsState.autoHeal.lastError = error.message || String(error);
+    console.warn(`Auto-heal monitor failed: ${metricsState.autoHeal.lastError}`);
+  } finally {
+    metricsState.autoHeal.running = false;
+  }
 }
 
 async function waitForFileRestoreReady(config, namespace, podName, timeoutSeconds = 600) {
@@ -1590,9 +1843,206 @@ function parseLiveFileRows(output, parentPath) {
   });
 }
 
+function prometheusEscape(value) {
+  return String(value ?? '').replaceAll('\\', '\\\\').replaceAll('\n', '\\n').replaceAll('"', '\\"');
+}
+
+function prometheusLine(name, labels, value) {
+  const entries = Object.entries(labels || {}).filter(([, item]) => item !== undefined && item !== null && item !== '');
+  const suffix = entries.length ? `{${entries.map(([key, item]) => `${key}="${prometheusEscape(item)}"`).join(',')}}` : '';
+  return `${name}${suffix} ${Number.isFinite(Number(value)) ? value : 0}`;
+}
+
+function podAutoHealRetries(pod) {
+  return Number.parseInt(pod?.metadata?.annotations?.[autoHealRetryAnnotation] || '0', 10) || 0;
+}
+
+function jobAutoHealRetries(job) {
+  return Number.parseInt(job?.metadata?.annotations?.[autoHealRetryAnnotation] || '0', 10) || 0;
+}
+
+async function collectClusterMetrics(config = null) {
+  const activeConfig = config || await readConfig();
+  const label = `${appLabelName}=${appLabelValue}`;
+  try {
+    const [podsJson, jobsJson, schedulesJson] = await Promise.all([
+      kubectlJson(activeConfig, ['get', 'pods', '-A', '-l', label]),
+      kubectlJson(activeConfig, ['get', 'jobs', '-A', '-l', label]),
+      kubectlJson(activeConfig, ['get', 'cronjobs', '-A', '-l', `${appLabelName}=${appLabelValue},${appLabelComponent}=schedule`])
+    ]);
+    metricsState.cluster = {
+      lastScrapeAt: new Date().toISOString(),
+      lastSuccess: true,
+      lastError: '',
+      pods: (podsJson.items || [])
+        .filter((pod) => ['on-demand-backup', 'schedule'].includes(pod.metadata?.labels?.[appLabelComponent] || ''))
+        .map((pod) => ({
+        namespace: pod.metadata?.namespace || '',
+        name: pod.metadata?.name || '',
+        component: pod.metadata?.labels?.[appLabelComponent] || '',
+        pvc: pod.metadata?.labels?.['backup-pvc'] || '',
+        phase: pod.status?.phase || 'Unknown',
+        retries: podAutoHealRetries(pod)
+      })),
+      jobs: (jobsJson.items || []).map((job) => ({
+        namespace: job.metadata?.namespace || '',
+        name: job.metadata?.name || '',
+        component: job.metadata?.labels?.[appLabelComponent] || '',
+        pvc: job.metadata?.labels?.['backup-pvc'] || '',
+        status: Number(job.status?.failed || 0) > 0 ? 'failed' : Number(job.status?.active || 0) > 0 ? 'active' : Number(job.status?.succeeded || 0) > 0 ? 'succeeded' : 'unknown',
+        retries: jobAutoHealRetries(job)
+      })),
+      schedules: (schedulesJson.items || []).map((schedule) => ({
+        namespace: schedule.metadata?.namespace || '',
+        name: schedule.metadata?.name || '',
+        pvc: schedule.metadata?.labels?.['backup-pvc'] || '',
+        suspended: Boolean(schedule.spec?.suspend)
+      }))
+    };
+  } catch (error) {
+    metricsState.cluster.lastScrapeAt = new Date().toISOString();
+    metricsState.cluster.lastSuccess = false;
+    metricsState.cluster.lastError = error.message || String(error);
+  }
+  return metricsState.cluster;
+}
+
+async function metricsSnapshot() {
+  const config = await readConfig().catch(() => null);
+  if (config?.clusterId || config?.id) await collectClusterMetrics(config);
+  metricsState.autoHeal.enabled = Boolean(config?.autoHealEnabled);
+  metricsState.autoHeal.maxRetries = Number.parseInt(normalizeAutoHealRetries(config?.autoHealRetries), 10);
+  return {
+    process: {
+      startedAt: new Date(metricsState.startedAt).toISOString(),
+      uptimeSeconds: Math.round(process.uptime()),
+      memory: process.memoryUsage()
+    },
+    config: {
+      clusterName: config?.clusterName || '',
+      clusterId: config?.clusterId || config?.id || '',
+      autoHealEnabled: Boolean(config?.autoHealEnabled),
+      autoHealRetries: normalizeAutoHealRetries(config?.autoHealRetries)
+    },
+    jobs: [...jobs.values()].map((job) => ({ id: job.id, type: job.type, status: job.status, startedAt: job.startedAt, finishedAt: job.finishedAt })),
+    autoHeal: {
+      running: metricsState.autoHeal.running,
+      enabled: metricsState.autoHeal.enabled,
+      maxRetries: metricsState.autoHeal.maxRetries,
+      runs: metricsState.autoHeal.runs,
+      lastRunAt: metricsState.autoHeal.lastRunAt,
+      lastSuccess: metricsState.autoHeal.lastSuccess,
+      lastError: metricsState.autoHeal.lastError,
+      actions: Object.fromEntries(metricsState.autoHeal.actions),
+      exhausted: Object.fromEntries(metricsState.autoHeal.exhausted)
+    },
+    cluster: metricsState.cluster
+  };
+}
+
+async function prometheusMetrics() {
+  const snapshot = await metricsSnapshot();
+  const lines = [
+    '# HELP qbackup_up qbackup process health.',
+    '# TYPE qbackup_up gauge',
+    prometheusLine('qbackup_up', {}, 1),
+    '# HELP qbackup_process_uptime_seconds qbackup process uptime.',
+    '# TYPE qbackup_process_uptime_seconds gauge',
+    prometheusLine('qbackup_process_uptime_seconds', {}, snapshot.process.uptimeSeconds),
+    '# HELP qbackup_process_memory_bytes qbackup process memory usage.',
+    '# TYPE qbackup_process_memory_bytes gauge',
+    prometheusLine('qbackup_process_memory_bytes', { kind: 'rss' }, snapshot.process.memory.rss),
+    prometheusLine('qbackup_process_memory_bytes', { kind: 'heap_used' }, snapshot.process.memory.heapUsed),
+    '# HELP qbackup_autoheal_enabled Whether auto-healing is enabled.',
+    '# TYPE qbackup_autoheal_enabled gauge',
+    prometheusLine('qbackup_autoheal_enabled', {}, snapshot.config.autoHealEnabled ? 1 : 0),
+    '# HELP qbackup_autoheal_max_retries Configured maximum auto-heal retries.',
+    '# TYPE qbackup_autoheal_max_retries gauge',
+    prometheusLine('qbackup_autoheal_max_retries', {}, Number(snapshot.config.autoHealRetries)),
+    '# HELP qbackup_autoheal_runs_total Number of auto-heal monitor passes.',
+    '# TYPE qbackup_autoheal_runs_total counter',
+    prometheusLine('qbackup_autoheal_runs_total', {}, snapshot.autoHeal.runs),
+    '# HELP qbackup_autoheal_last_run_success Last auto-heal run result.',
+    '# TYPE qbackup_autoheal_last_run_success gauge',
+    prometheusLine('qbackup_autoheal_last_run_success', {}, snapshot.autoHeal.lastSuccess ? 1 : 0),
+    '# HELP qbackup_cluster_scrape_success Last Kubernetes metrics scrape result.',
+    '# TYPE qbackup_cluster_scrape_success gauge',
+    prometheusLine('qbackup_cluster_scrape_success', {}, snapshot.cluster.lastSuccess ? 1 : 0),
+    '# HELP qbackup_http_requests_total HTTP requests by method, route, and status.',
+    '# TYPE qbackup_http_requests_total counter'
+  ];
+
+  for (const [key, value] of metricsState.httpRequests) lines.push(prometheusLine('qbackup_http_requests_total', JSON.parse(key), value));
+  lines.push('# HELP qbackup_http_request_duration_seconds HTTP request duration histogram.');
+  lines.push('# TYPE qbackup_http_request_duration_seconds histogram');
+  const histogramCounts = new Map();
+  for (const [key, value] of metricsState.httpDurations) {
+    const labels = JSON.parse(key);
+    if (labels.le === '_sum') {
+      const { le, ...rest } = labels;
+      lines.push(prometheusLine('qbackup_http_request_duration_seconds_sum', rest, value));
+    } else if (labels.le === '+Inf') {
+      const { le, ...rest } = labels;
+      histogramCounts.set(JSON.stringify(rest), value);
+      lines.push(prometheusLine('qbackup_http_request_duration_seconds_bucket', labels, value));
+    } else {
+      lines.push(prometheusLine('qbackup_http_request_duration_seconds_bucket', labels, value));
+    }
+  }
+  for (const [key, value] of histogramCounts) lines.push(prometheusLine('qbackup_http_request_duration_seconds_count', JSON.parse(key), value));
+
+  lines.push('# HELP qbackup_async_jobs In-memory qbackup async jobs by status.');
+  lines.push('# TYPE qbackup_async_jobs gauge');
+  const asyncJobCounts = new Map();
+  for (const job of snapshot.jobs) incrementMetric(asyncJobCounts, { type: job.type, status: job.status });
+  for (const [key, value] of asyncJobCounts) lines.push(prometheusLine('qbackup_async_jobs', JSON.parse(key), value));
+  lines.push('# HELP qbackup_backup_pods qbackup-owned backup helper pods by phase.');
+  lines.push('# TYPE qbackup_backup_pods gauge');
+  for (const pod of snapshot.cluster.pods) lines.push(prometheusLine('qbackup_backup_pods', { namespace: pod.namespace, pod: pod.name, component: pod.component, pvc: pod.pvc, phase: pod.phase }, 1));
+  lines.push('# HELP qbackup_backup_pod_autoheal_retries Auto-heal retries recorded on qbackup pods.');
+  lines.push('# TYPE qbackup_backup_pod_autoheal_retries gauge');
+  for (const pod of snapshot.cluster.pods) lines.push(prometheusLine('qbackup_backup_pod_autoheal_retries', { namespace: pod.namespace, pod: pod.name, component: pod.component, pvc: pod.pvc }, pod.retries));
+  lines.push('# HELP qbackup_backup_jobs qbackup-owned backup jobs by status.');
+  lines.push('# TYPE qbackup_backup_jobs gauge');
+  for (const job of snapshot.cluster.jobs) lines.push(prometheusLine('qbackup_backup_jobs', { namespace: job.namespace, job: job.name, component: job.component, pvc: job.pvc, status: job.status }, 1));
+  lines.push('# HELP qbackup_schedule_cronjobs qbackup CronJob schedules.');
+  lines.push('# TYPE qbackup_schedule_cronjobs gauge');
+  for (const schedule of snapshot.cluster.schedules) lines.push(prometheusLine('qbackup_schedule_cronjobs', { namespace: schedule.namespace, cronjob: schedule.name, pvc: schedule.pvc, suspended: String(schedule.suspended) }, 1));
+  lines.push('# HELP qbackup_autoheal_actions_total Auto-heal actions by kind and result.');
+  lines.push('# TYPE qbackup_autoheal_actions_total counter');
+  for (const [key, value] of metricsState.autoHeal.actions) lines.push(prometheusLine('qbackup_autoheal_actions_total', JSON.parse(key), value));
+  lines.push('# HELP qbackup_autoheal_exhausted_total Resources that reached the retry limit.');
+  lines.push('# TYPE qbackup_autoheal_exhausted_total counter');
+  for (const [key, value] of metricsState.autoHeal.exhausted) lines.push(prometheusLine('qbackup_autoheal_exhausted_total', JSON.parse(key), value));
+  return `${lines.join('\n')}\n`;
+}
+
 app.get('/api/status', async (_req, res) => {
   const kubectl = await commandExists('kubectl', ['version', '--client']);
   res.json({ kubectl, configFile, auth: await authMeta() });
+});
+
+app.get('/api/metrics', requireAuth(), async (_req, res, next) => {
+  try {
+    res.json(await metricsSnapshot());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/metrics', async (req, res, next) => {
+  if (String(req.headers.accept || '').includes('text/html')) {
+    res.sendFile(path.join(distDir, 'index.html'), (error) => {
+      if (error) next();
+    });
+    return;
+  }
+  try {
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+    res.send(await prometheusMetrics());
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get('/api/healthz', (_req, res) => {
@@ -1940,6 +2390,7 @@ app.post('/api/schedules/:namespace/:name/run', requireAuth('schedules.manage'),
     await patchCronJobPlacement(config, req.params.namespace, req.params.name, nodeName);
     const jobName = k8sName('manual', req.params.name, Date.now().toString().slice(-8));
     const { stdout, stderr } = await run('kubectl', kubectlArgs(config, ['create', 'job', '-n', req.params.namespace, jobName, `--from=cronjob/${req.params.name}`]));
+    await annotateAutoHealParent(config, req.params.namespace, 'job', jobName, req.params.name);
     await logAudit('schedules.run', req.user.id, { namespace: req.params.namespace, cronjob: req.params.name, job: jobName });
     res.json({ output: stdout || stderr });
   } catch (error) {
@@ -2376,4 +2827,6 @@ app.listen(port, () => {
   console.log(`qbackup API listening on http://localhost:${port}`);
   refreshSchedulePlacements();
   setInterval(refreshSchedulePlacements, schedulePlacementRefreshMs).unref();
+  runAutoHeal();
+  setInterval(runAutoHeal, Number.isFinite(autoHealIntervalMs) ? autoHealIntervalMs : 30000).unref();
 });

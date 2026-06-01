@@ -1,0 +1,59 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: qbackup
+  namespace: qbackup
+  labels:
+    app.kubernetes.io/name: qbackup
+spec:
+  groups:
+    - name: qbackup.rules
+      rules:
+        - alert: QbackupMetricsDown
+          expr: up{job=~".*qbackup.*"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: qbackup metrics are not reachable
+            description: Prometheus has not been able to scrape qbackup for 5 minutes.
+        - alert: QbackupClusterScrapeFailing
+          expr: qbackup_cluster_scrape_success == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: qbackup cannot scrape Kubernetes backup resources
+            description: qbackup metrics report a failed Kubernetes scrape for 10 minutes.
+        - alert: QbackupAutoHealFailing
+          expr: qbackup_autoheal_enabled == 1 and qbackup_autoheal_last_run_success == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: qbackup auto-heal monitor is failing
+            description: qbackup auto-heal has not completed successfully for 10 minutes.
+        - alert: QbackupAutoHealRetryLimitReached
+          expr: increase(qbackup_autoheal_exhausted_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: qbackup auto-heal retry limit reached
+            description: A qbackup backup Pod or Job reached the configured retry limit and now needs operator attention.
+        - alert: QbackupFailedBackupPod
+          expr: sum(qbackup_backup_pods{phase="Failed"}) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: qbackup has failed backup Pods
+            description: One or more qbackup-owned backup Pods have remained failed for at least 15 minutes.
+        - alert: QbackupFailedBackupJob
+          expr: sum(qbackup_backup_jobs{status="failed"}) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: qbackup has failed backup Jobs
+            description: One or more qbackup-owned backup Jobs have remained failed for at least 15 minutes.

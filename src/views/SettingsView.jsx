@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { CheckCircle, Clock, Database, HardDrive } from 'lucide-react';
+import { CheckCircle, Clock, Database, HardDrive, HeartPulse } from 'lucide-react';
 import { api } from '../lib/api';
 import { CustomCheckbox, SelectField, SettingsPanel, TextField } from '../components/shared';
 
@@ -137,6 +137,14 @@ export default function SettingsView({ settings, setSettings, notify, refreshCon
           <TextField label="Parallel Backups" name="backupConcurrency" value={settings.backupConcurrency} onChange={handleChange} type="number" />
           <TextField label="Retention Days (0 to disable)" name="retentionDays" value={settings.retentionDays} onChange={handleChange} type="number" />
           <div className="md:col-span-2 text-xs text-slate-500 -mt-3">Limits how many selected PVC backups qbackup runs at the same time. Use 1 for safest cluster and storage load.</div>
+        </SettingsPanel>
+        <SettingsPanel icon={<HeartPulse />} title="Auto-Heal">
+          <label className="col-span-full flex items-center gap-3 p-4 border border-slate-800/80 bg-[#05080f] rounded-lg cursor-pointer hover:bg-slate-800/40 hover:border-slate-700 transition-colors">
+            <CustomCheckbox checked={settings.autoHealEnabled} onChange={() => handleChange({ target: { name: 'autoHealEnabled', type: 'checkbox', checked: !settings.autoHealEnabled } })} ariaLabel="Enable auto-heal" />
+            <div><div className="font-medium text-slate-200 text-sm">Enable backup auto-heal</div><div className="text-xs text-slate-400">Continuously replaces failed qbackup-owned backup Pods and failed scheduled backup Jobs.</div></div>
+          </label>
+          <TextField label="Retries Before Metrics-Only" name="autoHealRetries" value={settings.autoHealRetries} onChange={handleChange} type="number" />
+          <div className="md:col-span-2 text-xs text-slate-500 -mt-3">After this many replacement attempts qbackup stops recreating the resource and exposes the exhausted state in metrics.</div>
         </SettingsPanel>
         <div className="flex items-center justify-end pt-4 gap-4">
           <div className="flex items-center gap-4">{isSaved && <span className="text-emerald-600 text-sm font-medium flex items-center gap-1"><CheckCircle className="w-4 h-4" /> Saved</span>}<button disabled={(settings.clusters || []).length === 0} type="submit" className="px-6 py-2 bg-indigo-600 text-white rounded-lg font-medium hover:bg-indigo-700 shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-40">Save Configuration</button></div>
