@@ -19,7 +19,7 @@
     "concurrently": "^10.0.3",
     "express": "^5.1.0",
     "lucide-react": "^1.14.0",
-    "react": "^19.1.1",
+    "react": "^19.2.6",
     "react-dom": "^19.1.1",
     "vite": "^8.0.16"
   },
