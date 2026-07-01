@@ -234,7 +234,7 @@ export function NotificationBell({ notifications, open, setOpen, markAllRead, cl
         {unread > 0 && <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-rose-500 ring-2 ring-[#0A0E17]" />}
       </button>
       {open && (
-        <div className="absolute right-0 top-12 z-50 flex w-[380px] max-w-[calc(100vw-2rem)] origin-top-right flex-col overflow-hidden rounded-xl border border-slate-700/60 bg-[#0f172a] shadow-[0_16px_40px_-15px_rgba(0,0,0,0.5)] animate-[notificationSlideDown_0.2s_ease-out]">
+        <div className="absolute right-0 top-12 z-[10000] flex w-[380px] max-w-[calc(100vw-2rem)] origin-top-right flex-col overflow-hidden rounded-xl border border-slate-700/60 bg-[#0f172a] shadow-[0_16px_40px_-15px_rgba(0,0,0,0.5)] animate-[notificationSlideDown_0.2s_ease-out]">
           <div className="flex items-center justify-between border-b border-slate-800/80 bg-slate-900/50 px-5 py-4">
             <div>
               <div className="flex items-center gap-2 font-semibold text-slate-100">
@@ -296,7 +296,7 @@ export function NotificationBell({ notifications, open, setOpen, markAllRead, cl
             setOpen(true);
             markAllRead();
           }}
-          className="absolute right-0 top-12 z-40 w-[20rem] max-w-[calc(100vw-2rem)] qbackup-card p-3 text-left shadow-2xl"
+          className="absolute right-0 top-12 z-[10000] w-[20rem] max-w-[calc(100vw-2rem)] qbackup-card p-3 text-left shadow-2xl"
         >
           <div className="flex items-start gap-3">
             <span className={`mt-1 h-2.5 w-2.5 rounded-full flex-shrink-0 ${peek.tone === 'error' ? 'bg-red-500' : peek.tone === 'success' ? 'bg-emerald-500' : 'bg-slate-400'}`} />
