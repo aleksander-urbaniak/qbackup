@@ -1,4 +1,4 @@
-FROM node:25-bookworm-slim AS deps
+FROM node:26-bookworm-slim AS deps
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
@@ -8,7 +8,7 @@ COPY . .
 RUN npm run build
 RUN npm prune --omit=dev
 
-FROM node:25-bookworm-slim AS runtime
+FROM node:26-bookworm-slim AS runtime
 WORKDIR /app
 
 ARG KUBECTL_VERSION=v1.30.0
