@@ -27,7 +27,7 @@
   "devDependencies": {
     "@playwright/test": "^1.60.0",
     "autoprefixer": "^10.4.21",
-    "postcss": "^8.5.14",
+    "postcss": "^8.5.16",
     "tailwindcss": "^4.3.0"
   },
   "overrides": {
