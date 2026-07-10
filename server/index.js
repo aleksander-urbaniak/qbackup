@@ -1199,9 +1199,9 @@ async function refreshSchedulePlacements() {
   }
 }
 
-function createAsyncJob(type, executor) {
+function createAsyncJob(type, permission, executor) {
   const id = crypto.randomUUID();
-  const job = { id, type, status: 'running', startedAt: new Date().toISOString(), finishedAt: null, code: null, output: [] };
+  const job = { id, type, permission, status: 'running', startedAt: new Date().toISOString(), finishedAt: null, code: null, output: [] };
   jobs.set(id, job);
   const append = (text, stream = 'stdout') => {
     job.output.push({ ts: new Date().toISOString(), stream, text: String(text) });
@@ -2403,7 +2403,7 @@ app.post('/api/backups', requireAuth('backups.run'), async (req, res, next) => {
     const config = await readConfig();
     const tags = req.body.pvcs || [];
     if (!tags.length) return res.status(400).json({ error: 'Select at least one PVC.' });
-    const job = createAsyncJob('backup', async ({ append }) => {
+    const job = createAsyncJob('backup', 'backups.run', async ({ append }) => {
       const concurrency = Number.parseInt(normalizeBackupConcurrency(config.backupConcurrency), 10);
       let nextIndex = 0;
       append(`[${new Date().toISOString()}] Running up to ${concurrency} backup(s) at the same time.\n`);
@@ -2460,7 +2460,7 @@ app.post('/api/restore', requireAuth('restore.run'), async (req, res, next) => {
     const [namespace, pvcName] = String(pvc).split('/');
     if (!namespace || !pvcName) return res.status(400).json({ error: 'Invalid PVC.' });
     await assertNotQbackupInternalPvc(config, namespace, pvcName);
-    const job = createAsyncJob('restore', async ({ append }) => {
+    const job = createAsyncJob('restore', 'restore.run', async ({ append }) => {
       const podName = k8sName('restore', pvcName, Date.now().toString().slice(-10));
       let restoreConsumers = async () => {};
       append(`[${new Date().toISOString()}] Starting restore for ${namespace}/${pvcName} from ${archive}\n`);
@@ -2780,10 +2780,15 @@ app.post('/api/live-files/download', requireAuth('files.manage'), async (req, re
 app.get('/api/jobs/:id', requireAuth(), (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found.' });
+  if (job.permission && !hasPermission(req.user, job.permission)) return res.status(401).json({ error: 'Unauthorized' });
   res.json(job);
 });
 
 app.get('/events/jobs/:id', requireAuth(), (req, res) => {
+  const initialJob = jobs.get(req.params.id);
+  if (initialJob?.permission && !hasPermission(req.user, initialJob.permission)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
