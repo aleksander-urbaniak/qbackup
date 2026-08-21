@@ -62,15 +62,23 @@ const appLabelName = 'app.kubernetes.io/name';
 const appLabelComponent = 'app.kubernetes.io/component';
 const appLabelValue = 'qbackup';
 const schedulePlacementRefreshMs = 60 * 1000;
+const scheduleStaggerMinutes = 10;
 const scheduleStartingDeadlineSeconds = 15 * 60;
 const backupJobActiveDeadlineSeconds = 2 * 60 * 60;
 const backupJobTtlSecondsAfterFinished = 24 * 60 * 60;
 const autoHealIntervalMs = Number.parseInt(process.env.AUTO_HEAL_INTERVAL_MS || '30000', 10);
+const jobRetentionMs = 60 * 60 * 1000;
+const maxRetainedJobs = 100;
+const maxJobOutputEntries = 2000;
+const autoHealExhaustedRetentionMs = 6 * 60 * 60 * 1000;
+const stateSweepIntervalMs = 60 * 1000;
+const downloadHelperLifetimeSeconds = 60 * 60;
 const autoHealRetryAnnotation = 'qbackup.io/autoheal-retries';
 const autoHealParentAnnotation = 'qbackup.io/autoheal-parent';
 const autoHealOriginalNameAnnotation = 'qbackup.io/autoheal-original-name';
 const jobs = new Map();
 const rateBuckets = new Map();
+const backupSlots = { limit: 0, active: 0, queue: [] };
 const metricsState = {
   startedAt: Date.now(),
   httpRequests: new Map(),
@@ -82,7 +90,7 @@ const metricsState = {
     runs: 0,
     actions: new Map(),
     exhausted: new Map(),
-    exhaustedResources: new Set(),
+    exhaustedResources: new Map(),
     lastRunAt: null,
     lastSuccess: false,
     lastError: ''
@@ -241,12 +249,56 @@ function incrementMetric(map, labels, amount = 1) {
   map.set(key, (map.get(key) || 0) + amount);
 }
 
+function jobEndedAt(job) {
+  return Date.parse(job.finishedAt || job.startedAt) || 0;
+}
+
+// The process is long-lived (a container that is rarely restarted), so every
+// in-memory collection needs an upper bound.
+function sweepEphemeralState() {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (job.status === 'running') continue;
+    if (now - jobEndedAt(job) > jobRetentionMs) jobs.delete(id);
+  }
+  const overflow = jobs.size - maxRetainedJobs;
+  if (overflow > 0) {
+    const finished = [...jobs.entries()]
+      .filter(([, job]) => job.status !== 'running')
+      .sort((a, b) => jobEndedAt(a[1]) - jobEndedAt(b[1]));
+    for (const [id] of finished.slice(0, overflow)) jobs.delete(id);
+  }
+  for (const [key, bucket] of rateBuckets) {
+    if (bucket.resetAt <= now) rateBuckets.delete(key);
+  }
+  for (const [key, seenAt] of metricsState.autoHeal.exhaustedResources) {
+    if (now - seenAt > autoHealExhaustedRetentionMs) metricsState.autoHeal.exhaustedResources.delete(key);
+  }
+}
+
+// Every label here must come from this fixed set. Echoing req.path back would
+// let any unmatched URL mint a new metric series (and 13 histogram series).
+const staticRouteLabels = new Set([
+  '/', '/metrics', '/api/status', '/api/metrics', '/api/healthz', '/api/readyz',
+  '/api/auth/bootstrap', '/api/auth/login', '/api/auth/logout', '/api/auth/me', '/api/auth/profile',
+  '/api/users', '/api/audit', '/api/config', '/api/clusters', '/api/pvcs', '/api/schedules',
+  '/api/backups', '/api/restore', '/api/file-restore/catalog', '/api/file-restore/download',
+  '/api/live-files/list', '/api/live-files/read', '/api/live-files/write', '/api/live-files/create-file',
+  '/api/live-files/create-folder', '/api/live-files/rename', '/api/live-files/delete', '/api/live-files/download'
+]);
+
 function routeLabel(req) {
-  if (req.path.startsWith('/api/jobs/')) return '/api/jobs/:id';
-  if (req.path.startsWith('/events/jobs/')) return '/events/jobs/:id';
-  if (req.path.startsWith('/api/schedules/')) return '/api/schedules/:namespace/:name';
-  if (req.path.startsWith('/api/archives/')) return '/api/archives/:namespace/:pvc';
-  return req.path || '/';
+  const value = req.path || '/';
+  if (staticRouteLabels.has(value)) return value;
+  if (value.startsWith('/api/jobs/')) return '/api/jobs/:id';
+  if (value.startsWith('/events/jobs/')) return '/events/jobs/:id';
+  if (value.startsWith('/api/archives/')) return '/api/archives/:namespace/:pvc';
+  if (/^\/api\/schedules\/[^/]+\/[^/]+\/run$/.test(value)) return '/api/schedules/:namespace/:name/run';
+  if (/^\/api\/schedules\/[^/]+\/[^/]+$/.test(value)) return '/api/schedules/:namespace/:name';
+  if (/^\/api\/clusters\/[^/]+\/switch$/.test(value)) return '/api/clusters/:id/switch';
+  if (/^\/api\/clusters\/[^/]+$/.test(value)) return '/api/clusters/:id';
+  if (/^\/api\/users\/[^/]+$/.test(value)) return '/api/users/:id';
+  return '/other';
 }
 
 function observeHttpRequest(req, res, seconds) {
@@ -326,13 +378,39 @@ function boolFromEnv(value) {
 }
 
 function normalizeBackupConcurrency(value) {
-  const parsed = Number.parseInt(String(value ?? defaults.backupConcurrency), 10);
-  return String(Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), 20) : 1);
+  const parsed = Number.parseInt(String(value ?? '3'), 10);
+  return String(Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), 20) : 3);
 }
 
 function normalizeAutoHealRetries(value) {
   const parsed = Number.parseInt(String(value ?? '2'), 10);
   return String(Number.isFinite(parsed) ? Math.min(Math.max(parsed, 0), 10) : 2);
+}
+
+function drainBackupSlots() {
+  while (backupSlots.queue.length > 0 && backupSlots.active < backupSlots.limit) {
+    backupSlots.active += 1;
+    backupSlots.queue.shift()();
+  }
+}
+
+// Process-wide cap on concurrent on-demand backup helper Pods, so overlapping
+// requests share one budget instead of each getting its own worker pool.
+async function acquireBackupSlot(limit) {
+  backupSlots.limit = limit;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    backupSlots.active -= 1;
+    drainBackupSlots();
+  };
+  if (backupSlots.active < backupSlots.limit) {
+    backupSlots.active += 1;
+    return release;
+  }
+  await new Promise((resolve) => backupSlots.queue.push(resolve));
+  return release;
 }
 
 function assertClusterConfig(config) {
@@ -612,8 +690,15 @@ async function updateCluster(id, input) {
   return readConfig();
 }
 
+function isManagedKubeconfigPath(value) {
+  if (!value) return false;
+  const resolved = path.resolve(value);
+  return resolved.startsWith(path.resolve(kubeconfigDir) + path.sep);
+}
+
 async function deleteCluster(id) {
   const store = await readClusterStore();
+  const removed = store.clusters.find((cluster) => cluster.id === id);
   const clusters = store.clusters.filter((cluster) => cluster.id !== id);
   if (clusters.length === store.clusters.length) {
     const error = new Error('Cluster not found.');
@@ -622,6 +707,11 @@ async function deleteCluster(id) {
   }
   const activeClusterId = clusters.length === 0 ? '' : store.activeClusterId === id ? clusters[0].id : store.activeClusterId;
   await writeClusterStore({ activeClusterId, clusters });
+  // Only remove kubeconfigs this app wrote; an operator-supplied KUBECONFIG_PATH
+  // is not ours to delete.
+  if (isManagedKubeconfigPath(removed?.kubeconfigPath) && !clusters.some((cluster) => cluster.kubeconfigPath === removed.kubeconfigPath)) {
+    await fs.rm(removed.kubeconfigPath, { force: true }).catch(() => null);
+  }
   return readConfig();
 }
 
@@ -983,6 +1073,33 @@ async function prepareRestoreConsumers(config, namespace, pvc, append) {
   };
 }
 
+function cronFixedNumber(field) {
+  return /^\d+$/.test(field) ? Number(field) : null;
+}
+
+// Spreads a batch of schedules across the hour so a shared cron time does not
+// fire every backup Job at once. Left untouched when the shift cannot be
+// expressed safely (wildcards, lists, or a shift that would cross midnight
+// while day-of-month/day-of-week are pinned).
+function staggerSchedule(schedule, offsetMinutes) {
+  if (!offsetMinutes) return schedule;
+  const parts = String(schedule).trim().split(/\s+/);
+  if (parts.length !== 5) return schedule;
+  const minute = cronFixedNumber(parts[0]);
+  if (minute === null) return schedule;
+  const total = minute + offsetMinutes;
+  const hourShift = Math.floor(total / 60);
+  if (!hourShift) return [String(total % 60), ...parts.slice(1)].join(' ');
+  const hour = cronFixedNumber(parts[1]);
+  if (hour === null) return schedule;
+  if (hour + hourShift >= 24 && !(parts[2] === '*' && parts[4] === '*')) return schedule;
+  return [String(total % 60), String((hour + hourShift) % 24), ...parts.slice(2)].join(' ');
+}
+
+function scheduleStaggerOffset(index, concurrency) {
+  return Math.floor(index / Math.max(concurrency, 1)) * scheduleStaggerMinutes;
+}
+
 function cronJobManifest(config, namespace, pvc, schedule, nodeName = '') {
   const cronjobName = k8sName('pvc-backup', pvc);
   const retentionEnabled = String(config.retentionDays) === '0' ? 'false' : 'true';
@@ -1201,11 +1318,16 @@ async function refreshSchedulePlacements() {
 
 function createAsyncJob(type, permission, executor) {
   const id = crypto.randomUUID();
-  const job = { id, type, permission, status: 'running', startedAt: new Date().toISOString(), finishedAt: null, code: null, output: [] };
+  const job = { id, type, permission, status: 'running', startedAt: new Date().toISOString(), finishedAt: null, code: null, output: [], droppedOutput: 0 };
   jobs.set(id, job);
   const append = (text, stream = 'stdout') => {
     job.output.push({ ts: new Date().toISOString(), stream, text: String(text) });
+    if (job.output.length > maxJobOutputEntries) {
+      job.droppedOutput += job.output.length - maxJobOutputEntries;
+      job.output.splice(0, job.output.length - maxJobOutputEntries);
+    }
   };
+  sweepEphemeralState();
   Promise.resolve()
     .then(() => executor({ append, job }))
     .then(() => {
@@ -1379,6 +1501,22 @@ ${podPlacementYaml(nodeName, 2)}  restartPolicy: Never
 `;
 }
 
+// Helper images are not guaranteed to ship zip, and an air-gapped cluster cannot
+// reach a package mirror. Fail with a message that names the cause.
+function ensureZipShellScript() {
+  return `if ! command -v zip >/dev/null 2>&1; then
+  if command -v apk >/dev/null 2>&1; then apk add --no-cache zip >/dev/null 2>&1 || true
+  elif command -v apt-get >/dev/null 2>&1; then (apt-get update >/dev/null 2>&1 && apt-get install -y zip >/dev/null 2>&1) || true
+  elif command -v microdnf >/dev/null 2>&1; then microdnf install -y zip >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y zip >/dev/null 2>&1 || true
+  fi
+fi
+if ! command -v zip >/dev/null 2>&1; then
+  echo "qbackup: helper image has no zip and it could not be installed (offline package mirror or unsupported base image). Set Helper image to one that includes zip." >&2
+  exit 6
+fi`;
+}
+
 function fileRestorePodManifest(config, namespace, pvc, archive, selectedPath, podName) {
   return `apiVersion: v1
 kind: Pod
@@ -1391,6 +1529,7 @@ metadata:
     backup-pvc: ${pvc}
 spec:
   restartPolicy: Never
+  activeDeadlineSeconds: ${downloadHelperLifetimeSeconds}
   containers:
     - name: file-restore
       image: ${yamlString(config.helperImage)}
@@ -1400,9 +1539,7 @@ spec:
         - |
           archive="/backup/\${BACKUP_ROOT}/\${CLUSTER_NAME}/\${PVC_NAMESPACE}/\${PVC_NAME}/\${ARCHIVE_NAME}"
           test -f "$archive"
-          if ! command -v zip >/dev/null 2>&1; then
-            apk add --no-cache zip >/dev/null
-          fi
+${indentBlock(ensureZipShellScript(), 10)}
           mkdir -p /work/extract
           tar -xzf "$archive" -C /work/extract
           selected="\${SELECTED_PATH}"
@@ -1415,7 +1552,7 @@ spec:
             (cd "/work/extract/$parent" && zip -qr /work/output.zip "$name")
           fi
           touch /work/ready
-          sleep 300
+          sleep ${downloadHelperLifetimeSeconds}
       readinessProbe:
         exec:
           command: ["test", "-f", "/work/ready"]
@@ -1547,6 +1684,7 @@ metadata:
     backup-pvc: ${pvc}
 spec:
 ${podPlacementYaml(nodeName, 2)}  restartPolicy: Never
+  activeDeadlineSeconds: ${downloadHelperLifetimeSeconds}
   containers:
     - name: download
       image: ${yamlString(config.helperImage)}
@@ -1554,9 +1692,7 @@ ${podPlacementYaml(nodeName, 2)}  restartPolicy: Never
       command: ["/bin/sh", "-ceu"]
       args:
         - |
-          if ! command -v zip >/dev/null 2>&1; then
-            apk add --no-cache zip >/dev/null
-          fi
+${indentBlock(ensureZipShellScript(), 10)}
           selected="\${SELECTED_PATH}"
           if [ "$selected" = "." ]; then
             (cd /target && zip -qr /work/output.zip .)
@@ -1567,7 +1703,7 @@ ${podPlacementYaml(nodeName, 2)}  restartPolicy: Never
             (cd "/target/$parent" && zip -qr /work/output.zip "$name")
           fi
           touch /work/ready
-          sleep 300
+          sleep ${downloadHelperLifetimeSeconds}
       readinessProbe:
         exec:
           command: ["test", "-f", "/work/ready"]
@@ -1630,7 +1766,11 @@ async function runHelperPod(config, namespace, manifest, podName, append = () =>
     const phase = await waitForPodCompletion(config, namespace, attemptPodName, append, timeoutSeconds);
     const logs = await run('kubectl', kubectlArgs(config, ['logs', '-n', namespace, attemptPodName])).then((result) => result.stdout || result.stderr).catch((error) => error.stdout || error.stderr || '');
     if (logs) append(logs.endsWith('\n') ? logs : `${logs}\n`);
-    await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, attemptPodName, '--ignore-not-found', '--wait=false'])).catch(() => null);
+    if (phase !== 'Succeeded' && config.keepFailedPods) {
+      append(`[${new Date().toISOString()}] Keeping failed helper Pod ${namespace}/${attemptPodName} for inspection (Keep failed helper Pods is on). Delete it manually when done.\n`, 'stderr');
+    } else {
+      await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, attemptPodName, '--ignore-not-found', '--wait=false'])).catch(() => null);
+    }
     if (phase === 'Succeeded') return logs;
     lastError = new Error(`Helper Pod ${namespace}/${attemptPodName} finished with phase=${phase}`);
     incrementMetric(metricsState.autoHeal.actions, { kind: 'helper_pod', result: attempt < maxRetries ? 'retry' : 'failed' });
@@ -1652,14 +1792,18 @@ function ownerKind(resource, kind) {
 function autoHealExhausted(kind, resourceId = '') {
   const key = `${kind}:${resourceId}`;
   if (metricsState.autoHeal.exhaustedResources.has(key)) return;
-  metricsState.autoHeal.exhaustedResources.add(key);
+  metricsState.autoHeal.exhaustedResources.set(key, Date.now());
   incrementMetric(metricsState.autoHeal.exhausted, { kind });
 }
 
 async function recreateStandalonePod(config, pod, retries) {
   const namespace = pod.metadata?.namespace;
   const currentName = pod.metadata?.name;
+  const pvc = pod.metadata?.labels?.['backup-pvc'] || '';
   const nextName = k8sName('heal', currentName, Date.now().toString().slice(-8));
+  // Re-resolve placement instead of reusing the old node (it may be why the pod
+  // failed) or dropping it entirely (an RWO volume may only attach on one node).
+  const nodeName = pvc ? await findPvcConsumerNode(config, namespace, pvc).catch(() => '') : '';
   const manifest = {
     apiVersion: 'v1',
     kind: 'Pod',
@@ -1675,8 +1819,8 @@ async function recreateStandalonePod(config, pod, retries) {
     },
     spec: pod.spec
   };
-  delete manifest.spec.nodeName;
-  delete manifest.spec.restartPolicy;
+  if (nodeName) manifest.spec.nodeName = nodeName;
+  else delete manifest.spec.nodeName;
   manifest.spec.restartPolicy = 'Never';
   await run('kubectl', kubectlArgs(config, ['delete', 'pod', '-n', namespace, currentName, '--ignore-not-found', '--wait=false']));
   await runWithInput('kubectl', kubectlArgs(config, ['apply', '-f', '-']), JSON.stringify(manifest));
@@ -1925,6 +2069,11 @@ async function metricsSnapshot() {
       autoHealRetries: normalizeAutoHealRetries(config?.autoHealRetries)
     },
     jobs: [...jobs.values()].map((job) => ({ id: job.id, type: job.type, status: job.status, startedAt: job.startedAt, finishedAt: job.finishedAt })),
+    backupSlots: {
+      limit: Number.parseInt(normalizeBackupConcurrency(config?.backupConcurrency), 10),
+      active: backupSlots.active,
+      queued: backupSlots.queue.length
+    },
     autoHeal: {
       running: metricsState.autoHeal.running,
       enabled: metricsState.autoHeal.enabled,
@@ -1996,6 +2145,11 @@ async function prometheusMetrics() {
   const asyncJobCounts = new Map();
   for (const job of snapshot.jobs) incrementMetric(asyncJobCounts, { type: job.type, status: job.status });
   for (const [key, value] of asyncJobCounts) lines.push(prometheusLine('qbackup_async_jobs', JSON.parse(key), value));
+  lines.push('# HELP qbackup_backup_slots Shared on-demand backup slot budget.');
+  lines.push('# TYPE qbackup_backup_slots gauge');
+  lines.push(prometheusLine('qbackup_backup_slots', { state: 'limit' }, snapshot.backupSlots.limit));
+  lines.push(prometheusLine('qbackup_backup_slots', { state: 'active' }, snapshot.backupSlots.active));
+  lines.push(prometheusLine('qbackup_backup_slots', { state: 'queued' }, snapshot.backupSlots.queued));
   lines.push('# HELP qbackup_backup_pods qbackup-owned backup helper pods by phase.');
   lines.push('# TYPE qbackup_backup_pods gauge');
   for (const pod of snapshot.cluster.pods) lines.push(prometheusLine('qbackup_backup_pods', { namespace: pod.namespace, pod: pod.name, component: pod.component, pvc: pod.pvc, phase: pod.phase }, 1));
@@ -2236,7 +2390,7 @@ app.delete('/api/clusters/:id', requireAuth('settings.write'), async (req, res, 
   }
 });
 
-app.post('/api/clusters/:id/switch', requireAuth(), async (req, res, next) => {
+app.post('/api/clusters/:id/switch', requireAuth('settings.write'), async (req, res, next) => {
   try {
     const saved = await switchCluster(req.params.id);
     await logAudit('clusters.switch', req.user.id, { clusterId: req.params.id });
@@ -2326,17 +2480,24 @@ app.post('/api/schedules', requireAuth('schedules.manage'), async (req, res, nex
     const config = await readConfig();
     const { pvcs = [], schedule = config.defaultSchedule } = req.body;
     if (!pvcs.length) return res.status(400).json({ error: 'Select at least one PVC.' });
+    const concurrency = Number.parseInt(normalizeBackupConcurrency(config.backupConcurrency), 10);
     const results = [];
+    let index = 0;
     for (const tag of pvcs) {
       const [namespace, pvc] = String(tag).split('/');
       if (!namespace || !pvc) throw new Error(`Invalid PVC tag: ${tag}`);
       await assertNotQbackupInternalPvc(config, namespace, pvc);
       const nodeName = await findPvcConsumerNode(config, namespace, pvc);
-      const output = await applyManifest(config, cronJobManifest(config, namespace, pvc, schedule, nodeName));
-      results.push({ namespace, pvc, output });
+      const staggered = staggerSchedule(schedule, scheduleStaggerOffset(index++, concurrency));
+      const output = await applyManifest(config, cronJobManifest(config, namespace, pvc, staggered, nodeName));
+      results.push({ namespace, pvc, schedule: staggered, output });
     }
-    await writeConfig({ ...config, defaultSchedule: schedule });
-    await logAudit('schedules.create', req.user.id, { count: pvcs.length, schedule });
+    // Opt-in only: a one-off cron for one PVC must not silently become the
+    // default for everyone.
+    if (req.body.saveAsDefault === true && hasPermission(req.user, 'settings.write')) {
+      await writeConfig({ ...config, defaultSchedule: schedule });
+    }
+    await logAudit('schedules.create', req.user.id, { count: pvcs.length, schedule, savedAsDefault: req.body.saveAsDefault === true });
     res.json({ results });
   } catch (error) {
     next(error);
@@ -2403,21 +2564,35 @@ app.post('/api/backups', requireAuth('backups.run'), async (req, res, next) => {
     const config = await readConfig();
     const tags = req.body.pvcs || [];
     if (!tags.length) return res.status(400).json({ error: 'Select at least one PVC.' });
+    const internalKeys = await qbackupInternalPvcKeys(config);
+    for (const tag of tags) {
+      const [namespace, pvc] = String(tag).split('/');
+      if (!namespace || !pvc) return res.status(400).json({ error: `Invalid PVC tag: ${tag}` });
+      if (internalKeys.has(`${namespace}/${pvc}`)) {
+        return res.status(400).json({ error: `PVC ${namespace}/${pvc} stores qbackup's own runtime data and cannot be backed up, scheduled, or restored by qbackup while the app is running.` });
+      }
+    }
     const job = createAsyncJob('backup', 'backups.run', async ({ append }) => {
       const concurrency = Number.parseInt(normalizeBackupConcurrency(config.backupConcurrency), 10);
       let nextIndex = 0;
-      append(`[${new Date().toISOString()}] Running up to ${concurrency} backup(s) at the same time.\n`);
+      append(`[${new Date().toISOString()}] Running up to ${concurrency} backup(s) at the same time (limit is shared with any other backup running now).\n`);
       const worker = async () => {
         while (nextIndex < tags.length) {
           const tag = tags[nextIndex++];
-        const [namespace, pvc] = String(tag).split('/');
-        if (!namespace || !pvc) throw new Error(`Invalid PVC tag: ${tag}`);
-        await assertNotQbackupInternalPvc(config, namespace, pvc);
-        const podName = k8sName('backup', pvc, Date.now().toString().slice(-10));
-          const nodeName = await findPvcConsumerNode(config, namespace, pvc);
-          append(`[${new Date().toISOString()}] Starting backup for ${namespace}/${pvc}${nodeName ? ` on ${nodeName}` : ''}\n`);
-          await runHelperPod(config, namespace, backupPodManifest(config, namespace, pvc, podName, nodeName), podName, append);
-          append(`[${new Date().toISOString()}] Backup completed for ${namespace}/${pvc}\n`);
+          const [namespace, pvc] = String(tag).split('/');
+          if (backupSlots.active >= concurrency) {
+            append(`[${new Date().toISOString()}] Queued backup for ${namespace}/${pvc} until a backup slot is free\n`);
+          }
+          const releaseSlot = await acquireBackupSlot(concurrency);
+          try {
+            const podName = k8sName('backup', pvc, Date.now().toString().slice(-10));
+            const nodeName = await findPvcConsumerNode(config, namespace, pvc);
+            append(`[${new Date().toISOString()}] Starting backup for ${namespace}/${pvc}${nodeName ? ` on ${nodeName}` : ''}\n`);
+            await runHelperPod(config, namespace, backupPodManifest(config, namespace, pvc, podName, nodeName), podName, append);
+            append(`[${new Date().toISOString()}] Backup completed for ${namespace}/${pvc}\n`);
+          } finally {
+            releaseSlot();
+          }
         }
       };
       await Promise.all(Array.from({ length: Math.min(concurrency, tags.length) }, () => worker()));
@@ -2800,8 +2975,9 @@ app.get('/events/jobs/:id', requireAuth(), (req, res) => {
       res.end();
       return;
     }
-    const nextOutput = job.output.slice(sent);
-    sent = job.output.length;
+    // `sent` counts absolute lines, so trimmed-away output does not resend or skip.
+    const nextOutput = job.output.slice(Math.max(0, sent - job.droppedOutput));
+    sent = job.droppedOutput + job.output.length;
     res.write(`data: ${JSON.stringify({ ...job, output: nextOutput })}\n\n`);
     if (job.status !== 'running') {
       clearInterval(interval);
@@ -2834,4 +3010,5 @@ app.listen(port, () => {
   setInterval(refreshSchedulePlacements, schedulePlacementRefreshMs).unref();
   runAutoHeal();
   setInterval(runAutoHeal, Number.isFinite(autoHealIntervalMs) ? autoHealIntervalMs : 30000).unref();
+  setInterval(sweepEphemeralState, stateSweepIntervalMs).unref();
 });
