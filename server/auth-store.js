@@ -9,6 +9,7 @@ const dataFile = path.join(dataDir, 'auth.json');
 const legacyDataFile = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'k3s-pvc-backup-ui', 'auth.json');
 const sessionTtlMs = 7 * 24 * 60 * 60 * 1000;
 let dbWriteQueue = Promise.resolve();
+let dbCache = { key: '', db: null };
 
 export const roles = ['admin', 'manager', 'operator', 'auditor', 'viewer'];
 
@@ -73,6 +74,25 @@ export function toPublicUser(user) {
   };
 }
 
+// Every authenticated request resolves a session, so parsing the full file each
+// time is the hot path. The stat key means another replica's write still wins.
+async function cacheKey() {
+  try {
+    const stat = await fs.stat(dataFile);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return '';
+  }
+}
+
+async function readDbCached() {
+  const key = await cacheKey();
+  if (key && key === dbCache.key && dbCache.db) return dbCache.db;
+  const db = await readDb();
+  if (key) dbCache = { key, db };
+  return db;
+}
+
 async function readDb() {
   try {
     let content;
@@ -101,6 +121,7 @@ async function readDb() {
 }
 
 async function writeDb(db) {
+  dbCache = { key: '', db: null };
   await fs.mkdir(dataDir, { recursive: true });
   const tempFile = `${dataFile}.${process.pid}.${Date.now()}.tmp`;
   await fs.writeFile(tempFile, `${JSON.stringify(db, null, 2)}\n`, { mode: 0o600 });
@@ -110,6 +131,8 @@ async function writeDb(db) {
 
 async function mutateDb(mutator) {
   const run = dbWriteQueue.then(async () => {
+    // Never the cached object: mutators edit in place, and a throwing mutator
+    // would leave the cache holding uncommitted state.
     const db = await readDb();
     const result = await mutator(db);
     await writeDb(db);
@@ -120,12 +143,12 @@ async function mutateDb(mutator) {
 }
 
 export async function authMeta() {
-  const db = await readDb();
+  const db = await readDbCached();
   return { dataFile, userCount: db.users.length };
 }
 
 export async function countUsers() {
-  const db = await readDb();
+  const db = await readDbCached();
   return db.users.length;
 }
 
@@ -162,17 +185,17 @@ export async function createUser(input) {
 }
 
 export async function listUsers() {
-  const db = await readDb();
-  return db.users.sort((a, b) => a.username.localeCompare(b.username));
+  const db = await readDbCached();
+  return [...db.users].sort((a, b) => a.username.localeCompare(b.username));
 }
 
 export async function getUserByUsername(username) {
-  const db = await readDb();
+  const db = await readDbCached();
   return db.users.find((user) => user.username.toLowerCase() === String(username || '').trim().toLowerCase()) || null;
 }
 
 export async function getUserById(id) {
-  const db = await readDb();
+  const db = await readDbCached();
   return db.users.find((user) => user.id === id) || null;
 }
 
@@ -236,6 +259,10 @@ export async function verifyPassword(username, password) {
 
 export async function createSession(userId) {
   return mutateDb((db) => {
+    // Expired rows otherwise sit in the file forever unless that exact token is
+    // presented again.
+    const now = Date.now();
+    db.sessions = db.sessions.filter((entry) => Number(entry.expiresAt || 0) > now);
     const session = {
       token: crypto.randomBytes(32).toString('hex'),
       userId,
@@ -249,7 +276,7 @@ export async function createSession(userId) {
 
 export async function getUserBySession(token) {
   if (!token) return null;
-  const db = await readDb();
+  const db = await readDbCached();
   const session = db.sessions.find((entry) => entry.token === token);
   if (!session) return null;
   if (session.expiresAt < Date.now()) {
@@ -280,7 +307,7 @@ export async function logAudit(action, userId, details = {}) {
 }
 
 export async function listAudit() {
-  const db = await readDb();
+  const db = await readDbCached();
   return db.audit.slice(0, 200).map((entry) => ({
     ...entry,
     user: toPublicUser(db.users.find((user) => user.id === entry.userId))

@@ -6,6 +6,7 @@ import { CustomCheckbox } from './shared';
 export function ScheduleModal({ pvcs, initialSelected = [], defaultSchedule, onClose, onDone, notify }) {
   const [schedule, setSchedule] = useState(defaultSchedule || '0 2 * * *');
   const [checked, setChecked] = useState(initialSelected);
+  const [saveAsDefault, setSaveAsDefault] = useState(false);
   const [saving, setSaving] = useState(false);
   const allChecked = pvcs.length > 0 && checked.length === pvcs.length;
   const togglePvc = (id) => setChecked((prev) => prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]);
@@ -13,7 +14,7 @@ export function ScheduleModal({ pvcs, initialSelected = [], defaultSchedule, onC
   const submit = async () => {
     setSaving(true);
     try {
-      await api('/api/schedules', { method: 'POST', body: JSON.stringify({ pvcs: checked, schedule }) });
+      await api('/api/schedules', { method: 'POST', body: JSON.stringify({ pvcs: checked, schedule, saveAsDefault }) });
       onDone();
     } catch (error) {
       notify(error.message, 'error');
@@ -44,6 +45,11 @@ export function ScheduleModal({ pvcs, initialSelected = [], defaultSchedule, onC
               className="w-full bg-[#05080f] border border-slate-700/60 text-sm rounded-xl px-4 py-3 font-mono text-slate-200 focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/50 transition-all shadow-inner"
             />
             <p className="text-xs text-slate-500 mt-2">Format: Minute Hour Day Month Weekday</p>
+            <p className="text-xs text-slate-500 mt-1">Large batches are spread across the hour so they do not all start at once.</p>
+            <label className="flex items-center gap-2 mt-3 cursor-pointer">
+              <CustomCheckbox checked={saveAsDefault} onChange={() => setSaveAsDefault((prev) => !prev)} ariaLabel="Save as default schedule" />
+              <span className="text-xs text-slate-400">Also save this as the default schedule for new schedules</span>
+            </label>
           </div>
 
           <div>
